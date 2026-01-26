@@ -1,3 +1,4 @@
+# netbox_plugin_ruckus_r1_sync/sync.py
 from __future__ import annotations
 
 import datetime
@@ -69,7 +70,6 @@ def _norm_mac(s: str) -> str:
 
 
 def _mac_to_serial(mac: str) -> str:
-    # stable + unique for client devices
     mac = _norm_mac(mac)
     return mac.replace(":", "")[:50]
 
@@ -215,7 +215,6 @@ def _get_or_create_manufacturer_named(name: str) -> Manufacturer:
 
 
 def _get_or_create_ruckus_manufacturer() -> Manufacturer:
-    # requirement for infra devices
     return _get_or_create_manufacturer_named("RUCKUS Networks")
 
 
@@ -245,9 +244,6 @@ def _get_or_create_device_infra(
     name: str,
     serial: str = "",
 ) -> Device:
-    """
-    Infra devices: Manufacturer always RUCKUS Networks, uniqueness by serial.
-    """
     role = _get_or_create_role(role_name or cfg.default_device_role or "Device")
     manu = _get_or_create_ruckus_manufacturer()
     dtype = _get_or_create_devicetype(manu, model or "Generic")
@@ -331,11 +327,6 @@ def _ensure_interface(device: Device, name: str):
 
 
 def _assign_ip_to_interface_best_effort(ip_obj: IPAddress, iface) -> None:
-    """
-    NetBox v4 uses generic assignment (assigned_object), older may have 'assigned_object' too.
-    We'll try both.
-    """
-    # generic assignment (NetBox v3/v4)
     if hasattr(ip_obj, "assigned_object"):
         try:
             ip_obj.assigned_object = iface
@@ -344,7 +335,6 @@ def _assign_ip_to_interface_best_effort(ip_obj: IPAddress, iface) -> None:
         except Exception:
             pass
 
-    # legacy-ish field
     if hasattr(ip_obj, "interface"):
         try:
             ip_obj.interface = iface
@@ -365,18 +355,11 @@ def _set_primary_ip4_best_effort(device: Device, ip_obj: IPAddress) -> None:
 
 
 def _upsert_client_as_dcim_device(cfg: RuckusR1TenantConfig, site: Site, cl: Dict[str, Any]) -> Tuple[Optional[Device], Optional[IPAddress]]:
-    """
-    Create/Update a NetBox dcim.Device for a Wi-Fi client.
-    - Unique by MAC (stored as serial = mac without :)
-    - Device.name is ALWAYS unique/stable: CL-<serial> (optionally with hostname prefix)
-    - Interface wlan0 with MAC
-    - IPAddress assigned to wlan0 + set as primary_ip4
-    """
     mac = _norm_mac(cl.get("macAddress") or cl.get("mac") or cl.get("clientMac") or "")
     if not _looks_like_mac(mac):
         return (None, None)
 
-    serial = _mac_to_serial(mac)  # e.g. 9249703b9a1b
+    serial = _mac_to_serial(mac)
     role = _get_or_create_role("Wireless Client")
 
     manu = _get_or_create_manufacturer_named("Client")
@@ -384,17 +367,12 @@ def _upsert_client_as_dcim_device(cfg: RuckusR1TenantConfig, site: Site, cl: Dic
     dtype = _get_or_create_devicetype(manu, model)
 
     raw_hostname = (cl.get("hostname") or "").strip()
-    # Use hostname only as *decorator*, never as the whole name
     host_part = ""
     if raw_hostname and not _looks_like_mac(raw_hostname):
-        # keep it safe & short
         host_part = _slugify(raw_hostname)[:20]
 
-    # Deterministic unique name within site+tenant
-    # (serial is unique per client MAC)
     name = f"CL-{host_part + '-' if host_part else ''}{serial[:12]}"
 
-    # Find by serial first (primary key)
     obj = Device.objects.filter(serial=serial).first()
 
     if not obj:
@@ -423,13 +401,10 @@ def _upsert_client_as_dcim_device(cfg: RuckusR1TenantConfig, site: Site, cl: Dic
             obj.serial = serial
             changed = True
 
-        # IMPORTANT: Do NOT rename to raw hostname (avoids collisions like "wlan0", "Mac", "iPhone", etc.)
-        # Only set name to our deterministic scheme if empty or if it looks wrong.
         if not obj.name or obj.name.lower() in ("wlan0", "unknown", "client"):
             obj.name = name[:64]
             changed = True
 
-        # Store hostname in description instead (optional)
         if hasattr(obj, "description"):
             desired_desc = f"R1 Client hostname={raw_hostname}" if raw_hostname else "R1 Client"
             if (obj.description or "") != desired_desc[:200]:
@@ -442,7 +417,6 @@ def _upsert_client_as_dcim_device(cfg: RuckusR1TenantConfig, site: Site, cl: Dic
         if changed:
             obj.save()
 
-    # Interface
     iface = _ensure_interface(obj, "wlan0")
     if hasattr(iface, "mac_address"):
         try:
@@ -452,7 +426,6 @@ def _upsert_client_as_dcim_device(cfg: RuckusR1TenantConfig, site: Site, cl: Dic
         except Exception:
             pass
 
-    # IP
     ip = (cl.get("ipAddress") or cl.get("ip") or "").strip()
     ip_obj = None
     if ip and ":" not in ip:
@@ -471,12 +444,6 @@ def _upsert_wired_client_as_dcim_device(
     *,
     iface_name: str = "eth0",
 ) -> Tuple[Optional[Device], Optional[IPAddress]]:
-    """
-    Wired client devices (from venues/switches/clients/query).
-    - Unique by MAC (serial=mac sans :)
-    - Interface eth0
-    - IP best-effort
-    """
     mac = _norm_mac(cl.get("macAddress") or cl.get("mac") or cl.get("clientMac") or cl.get("deviceMac") or "")
     if not _looks_like_mac(mac):
         return (None, None)
@@ -590,14 +557,9 @@ def _parse_link_speed_to_kbps(s: str) -> Optional[int]:
 
 
 def _capacity_to_kbps(cap: str) -> Optional[int]:
-    """
-    Handles e.g. "10G", "2.5G", "25G", "2.5G/5G/10G MultiGig".
-    Returns best-effort *maximum* in kbps.
-    """
     if not cap:
         return None
     t = cap.strip().lower()
-    # Extract tokens like 2.5g, 5g, 10g, 25g
     toks: List[float] = []
     for part in t.replace("multigig", "").replace("persecond", "").replace(" ", "").split("/"):
         p = part.strip()
@@ -610,7 +572,6 @@ def _capacity_to_kbps(cap: str) -> Optional[int]:
                 pass
         elif p.endswith("m"):
             try:
-                # treat as Mbps
                 return int(float(p[:-1]) * 1_000)
             except Exception:
                 pass
@@ -678,6 +639,46 @@ def _upsert_macaddress_best_effort(iface, mac: str) -> bool:
 
     obj.save()
     return True
+
+
+def _find_device_by_any_mac(cfg: RuckusR1TenantConfig, site: Site, mac: str) -> Optional[Device]:
+    """
+    Best-effort resolve a NetBox Device from a MAC.
+    Tries:
+      1) dcim.MACAddress.assigned_object -> Interface -> device
+      2) dcim.Interface.mac_address match
+    """
+    mac = _norm_mac(mac)
+    if not _looks_like_mac(mac):
+        return None
+
+    # 1) MACAddress model (NetBox >= 4)
+    try:
+        MACAddress = _nb_model("dcim", "MACAddress")
+        mac_obj = MACAddress.objects.filter(mac_address=mac).first()
+        if mac_obj:
+            ao = getattr(mac_obj, "assigned_object", None)
+            if ao and hasattr(ao, "device_id"):
+                dev = Device.objects.filter(id=ao.device_id, tenant=cfg.tenant, site=site).first()
+                if dev:
+                    return dev
+    except Exception:
+        pass
+
+    # 2) Interface.mac_address
+    try:
+        Interface = _nb_model("dcim", "Interface")
+        iface = Interface.objects.filter(
+            device__tenant=cfg.tenant,
+            device__site=site,
+            mac_address__iexact=mac,
+        ).select_related("device").first()
+        if iface and getattr(iface, "device", None):
+            return iface.device
+    except Exception:
+        pass
+
+    return None
 
 
 def _cable_supports_legacy_fields(Cable) -> bool:
@@ -753,6 +754,12 @@ def _create_cable(a_iface, b_iface, status: str = "connected") -> bool:
 
 
 def _create_wireless_link_best_effort(a_device: Device, b_device: Device, a_mac: str, b_mac: str) -> bool:
+    """
+    Creates wireless.WirelessLink if the model exists and supports either:
+      - interface_a/interface_b (or a_interface/b_interface)
+      - device_a/device_b (or a_device/b_device)
+    Also ensures 'mesh' interfaces and assigns MACs.
+    """
     try:
         WirelessLink = _nb_model("wireless", "WirelessLink")
     except Exception:
@@ -806,13 +813,11 @@ def _create_wireless_link_best_effort(a_device: Device, b_device: Device, a_mac:
         return False
 
 
+# -----------------
+# Switch ports + wired clients
+# -----------------
+
 def _sync_switch_ports_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, site: Site, venue_id: str) -> Tuple[int, int]:
-    """
-    /venues/switches/switchPorts/query
-    Creates/updates dcim.Interface on the corresponding switch device.
-    Matching: switchUnitId -> Device.serial
-    Returns: (touched_ifaces, touched_macs)
-    """
     touched_ifaces = 0
     touched_macs = 0
 
@@ -830,7 +835,6 @@ def _sync_switch_ports_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client,
 
         sw = Device.objects.filter(tenant=cfg.tenant, site=site, serial=switch_unit_id).first()
         if not sw and cfg.allow_stub_devices:
-            # fallback: build a stub switch (rare, but helps)
             sw_name = (p.get("switchName") or p.get("switchModel") or switch_unit_id).strip()
             sw_model = (p.get("switchModel") or "Switch").strip()
             sw = _get_or_create_device_infra(cfg, site, "Switch", sw_model, sw_name or switch_unit_id, serial=switch_unit_id)
@@ -845,17 +849,15 @@ def _sync_switch_ports_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client,
         iface = _ensure_interface(sw, ifname)
         touched_ifaces += 1
 
-        # MAC
         pmac = (p.get("portMac") or "").strip()
         if pmac and _upsert_macaddress_best_effort(iface, pmac):
             touched_macs += 1
 
-        # enabled/admin + speed + poe + description
-        admin_up = (p.get("adminStatus") == "Up")
+        admin_status = (p.get("adminStatus") or "").strip().lower()
+        admin_up = admin_status in ("up", "enabled", "true", "1")
+
         speed_kbps = _capacity_to_kbps(p.get("portSpeedCapacity") or "") or _parse_link_speed_to_kbps(p.get("portSpeed") or "")
         poe_enabled = p.get("poeEnabled")
-        if poe_enabled is None:
-            poe_enabled = p.get("poeEnabled")  # keep
 
         desc_parts = []
         if p.get("tags"):
@@ -890,13 +892,6 @@ def _sync_switch_clients_for_venue(
     site: Site,
     venue_id: str
 ) -> Tuple[int, int, int]:
-    """
-    /venues/switches/clients/query
-    - Upserts plugin model RuckusR1Client (as "wired" client)
-    - Upserts dcim.Device for wired client + eth0
-    - Best-effort create Cable between switch port and client eth0 (if switchUnitId + portIdentifier present)
-    Returns: (processed_clients, touched_ifaces, touched_cables)
-    """
     processed_clients = 0
     touched_ifaces = 0
     touched_cables = 0
@@ -923,12 +918,11 @@ def _sync_switch_clients_for_venue(
 
         switch_unit_id = (cl.get("switchUnitId") or cl.get("switchSerialNumber") or cl.get("switchSerial") or "").strip()
         port_name = (cl.get("portIdentifier") or cl.get("port") or cl.get("connectedPort") or "").strip()
-        # venue id effective
+
         vinfo = cl.get("venueInformation") or {}
         venue_id_effective = (vinfo.get("id") or venue_id or "").strip()
 
         if not _looks_like_mac(mac):
-            # salvage
             for _, v in cl.items():
                 if isinstance(v, str) and _looks_like_mac(v):
                     mac = _norm_mac(v)
@@ -937,7 +931,6 @@ def _sync_switch_clients_for_venue(
         if not _looks_like_mac(mac):
             mac = "unknown"
 
-        # Plugin model upsert (wired client)
         RuckusR1ClientModel.objects.update_or_create(
             tenant=cfg.tenant,
             mac=mac,
@@ -955,7 +948,6 @@ def _sync_switch_clients_for_venue(
             },
         )
 
-        # dcim device + eth0
         client_dev = None
         client_iface = None
         if mac != "unknown":
@@ -964,7 +956,6 @@ def _sync_switch_clients_for_venue(
                 client_iface = _ensure_interface(client_dev, "eth0")
                 touched_ifaces += 1
 
-        # Best-effort cable: switch port -> client eth0
         if client_dev and client_iface and switch_unit_id and port_name:
             sw = Device.objects.filter(tenant=cfg.tenant, site=site, serial=switch_unit_id).first()
             if sw:
@@ -977,6 +968,10 @@ def _sync_switch_clients_for_venue(
 
     return (processed_clients, touched_ifaces, touched_cables)
 
+
+# -----------------
+# Topology sync (wired + wireless links)
+# -----------------
 
 def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, site: Site, venue_id: str) -> Tuple[int, int, int, int]:
     touched_ifaces = 0
@@ -996,6 +991,7 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
     nodes = blob.get("nodes") if isinstance(blob.get("nodes"), list) else []
     edges = blob.get("edges") if isinstance(blob.get("edges"), list) else []
 
+    # Nodes -> devices + mgmt MACs/IPs
     for n in nodes:
         if not isinstance(n, dict):
             continue
@@ -1027,6 +1023,7 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
             if _upsert_macaddress_best_effort(mgmt, mac):
                 touched_macs += 1
 
+    # Edges -> cables + wireless links
     for e in edges:
         if not isinstance(e, dict):
             continue
@@ -1044,14 +1041,23 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
         a_dev = Device.objects.filter(serial=from_serial).first() if from_serial else None
         b_dev = Device.objects.filter(serial=to_serial).first() if to_serial else None
 
+        # NEW: MAC-based fallback (common when serials are missing/mismatched)
+        if not a_dev and from_mac:
+            a_dev = _find_device_by_any_mac(cfg, site, from_mac)
+        if not b_dev and to_mac:
+            b_dev = _find_device_by_any_mac(cfg, site, to_mac)
+
         if not a_dev and cfg.allow_stub_devices:
-            a_dev = _get_or_create_device_infra(cfg, site, "Device", "Device", from_name or from_serial or "device", serial=from_serial)
+            stub_serial = from_serial or (_mac_to_serial(from_mac) if _looks_like_mac(from_mac) else "")
+            a_dev = _get_or_create_device_infra(cfg, site, "Device", "Device", from_name or stub_serial or "device", serial=stub_serial)
         if not b_dev and cfg.allow_stub_devices:
-            b_dev = _get_or_create_device_infra(cfg, site, "Device", "Device", to_name or to_serial or "device", serial=to_serial)
+            stub_serial = to_serial or (_mac_to_serial(to_mac) if _looks_like_mac(to_mac) else "")
+            b_dev = _get_or_create_device_infra(cfg, site, "Device", "Device", to_name or stub_serial or "device", serial=stub_serial)
 
         if not a_dev or not b_dev:
             continue
 
+        # Wired cables
         if ctype == "wired":
             connected_port = (e.get("connectedPort") or "uplink").strip()
             corresponding_port = (e.get("correspondingPort") or "uplink").strip()
@@ -1062,6 +1068,7 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
 
             speed_kbps = _parse_link_speed_to_kbps(e.get("linkSpeed") or "")
             poe_enabled = e.get("poeEnabled")
+
             _set_interface_fields_best_effort(
                 a_iface,
                 speed_kbps=speed_kbps,
@@ -1072,9 +1079,15 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
             if _create_cable(a_iface, b_iface, status="connected"):
                 touched_cables += 1
 
-        elif ctype == "mesh":
-            if _create_wireless_link_best_effort(a_dev, b_dev, from_mac, to_mac):
-                touched_wlinks += 1
+        # NEW: Wireless links (be liberal with types)
+        else:
+            # R1 might return different tokens depending on backend/version
+            wireless_types = {
+                "mesh", "wireless", "wirelessmesh", "smartmesh", "apmesh", "ap-mesh", "wireless-mesh"
+            }
+            if ctype in wireless_types or "mesh" in ctype or "wireless" in ctype:
+                if _create_wireless_link_best_effort(a_dev, b_dev, from_mac, to_mac):
+                    touched_wlinks += 1
 
     return (touched_ifaces, touched_macs, touched_cables, touched_wlinks)
 
@@ -1143,12 +1156,12 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
                     if mgmt_ip and _upsert_ip(cfg, mgmt_ip):
                         processed_ips += 1
 
-                # NEW: Switch Ports -> dcim.Interface
+                # Switch Ports -> dcim.Interface
                 it_ports, mt_ports = _sync_switch_ports_for_venue(cfg, api, site, venue_id)
                 processed_ifaces += it_ports
                 processed_macs += mt_ports
 
-                # Clients (Wi-Fi) -> Plugin model + dcim.Device
+                # Wi-Fi Clients
                 clients = _query_all(api, "/venues/aps/clients/query", {"venueId": venue_id, "limit": 5000})
                 for cl in clients:
                     if not isinstance(cl, dict):
@@ -1198,32 +1211,32 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
                         },
                     )
 
-                    # HERE: create dcim.Device for client
                     if mac != "unknown":
                         _upsert_client_as_dcim_device(cfg, site, cl)
 
                     processed_clients += 1
 
-                # NEW: Switch Clients (wired)
+                # Switch Clients (wired)
                 sc, it_sc, ct_sc = _sync_switch_clients_for_venue(cfg, api, site, venue_id)
                 processed_clients += sc
                 processed_ifaces += it_sc
                 processed_cables += ct_sc
 
-                # Existing topology (cables/wlinks from /venues/{id}/topologies)
+                # Venue topologies (cables + wireless links)
                 it, mt, ct, wt = _sync_topologies_for_venue(cfg, api, site, venue_id)
                 processed_ifaces += it
                 processed_macs += mt
                 processed_cables += ct
                 processed_wlinks += wt
 
-            # Keep "processed" counters in log (they represent work done, not distinct totals)
             log.devices = processed_devices
             log.ips = processed_ips
             log.clients = processed_clients
             log.interfaces = processed_ifaces
             log.macs = processed_macs
             log.cables = processed_cables
+            # NOTE: your RuckusR1SyncLog model has 'tunnels' but not 'wireless_links';
+            # we keep it in cfg message only. If you want, add field + migrations.
             log.save()
 
             cfg.last_sync = _now()
@@ -1231,7 +1244,8 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
             cfg.last_sync_message = (
                 f"Sync OK. venues={log.venues} wlans={log.wlans} processed_devices={log.devices} "
                 f"processed_interfaces={log.interfaces} processed_macs={log.macs} processed_cables={log.cables} "
-                f"processed_ips={log.ips} processed_clients={log.clients} duration={(_now() - started).total_seconds():.2f}s"
+                f"processed_wlinks={processed_wlinks} processed_ips={log.ips} processed_clients={log.clients} "
+                f"duration={(_now() - started).total_seconds():.2f}s"
             )
             cfg.save()
 
@@ -1246,4 +1260,3 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
 
         _sync_log_finish(log, "failed", "Sync failed", message=_safe_str(e, 4000), error=_safe_str(e, 20000))
         raise
- 
