@@ -1,0 +1,6 @@
+PLUGINS_CONFIG = {
+    'ruckus_r1_sync': {
+        'client_id': 'dein_client_id',
+        'client_secret': 'dein_secret',
+    }
+}

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netbox-ruckus-r1-sync"
+version = "0.1.0"
+description = "NetBox plugin to sync RUCKUS One (R1) objects into NetBox"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Enrico Becker", email = "enrico.becker@ruckusnetworks.com" }
+]
+dependencies = [
+  "requests>=2.31.0"
+]
+
+[tool.setuptools]
+packages = { find = {} }
+
+[tool.setuptools.package-data]
+"ruckus_r1_sync" = ["templates/**/*.html"]
+ 

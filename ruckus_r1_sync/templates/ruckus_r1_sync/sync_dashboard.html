@@ -1,0 +1,47 @@
+{% extends "base/layout.html" %}
+{% load render_table from django_tables2 %}
+
+{% block title %}RUCKUS R1 Sync{% endblock %}
+
+{% block content %}
+<div class="container-fluid">
+
+  <div class="row mb-3">
+    <div class="col">
+      <h1 class="h3 mb-0">RUCKUS R1 Sync</h1>
+      <div class="text-muted">
+        Tenant-based configuration for RUCKUS One (R1) import & sync.
+      </div>
+    </div>
+
+    <div class="col-auto">
+      <a href="{% url 'plugins:ruckus_r1_sync:tenantconfig_add' %}" class="btn btn-primary">
+        <i class="mdi mdi-plus-thick"></i> Hinzufügen
+      </a>
+      <a href="{% url 'plugins:ruckus_r1_sync:sync_logs' %}" class="btn btn-outline-secondary">
+        <i class="mdi mdi-text-box-outline"></i> Logs
+      </a>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <strong>Tenant Configs</strong>
+    </div>
+
+    <div class="card-body p-0">
+      {% if table %}
+        {% render_table table %}
+      {% else %}
+        <div class="p-3">
+          <div class="alert alert-info mb-0">
+            No tenant configs yet. Click <strong>Hinzufügen</strong> to create one.
+          </div>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+{% endblock %}
+ 
