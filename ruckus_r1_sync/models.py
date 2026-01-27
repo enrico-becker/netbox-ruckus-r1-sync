@@ -68,7 +68,7 @@ class RuckusR1TenantConfig(NetBoxModel):
         verbose_name_plural = "RUCKUS R1 Tenant Configs"
 
     def __str__(self) -> str:
-        return f"{self.name} (Tenant: {self.tenant})"
+        return f"{self.name} (Mandant: {self.tenant})"
 
     def get_absolute_url(self):
         # IMPORTANT: must match urls.py name

@@ -5,6 +5,7 @@ import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from django.apps import apps
+from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
 from django.utils import timezone
@@ -15,6 +16,8 @@ from wireless.models import WirelessLAN
 
 from .models import RuckusR1TenantConfig, RuckusR1SyncLog, RuckusR1Client as RuckusR1ClientModel
 from .ruckus_api import RuckusR1Client
+
+from .mapping import map_venue_to_netbox, VenueMapping
 
 
 # -----------------
@@ -65,6 +68,19 @@ def _cfg_flag(cfg: RuckusR1TenantConfig, field: str, default: bool = True) -> bo
         return bool(default)
 
 
+def _plugin_cfg(key: str, default: Any = None) -> Any:
+    """
+    Read plugin config from configurations/plugins.py:
+      settings.PLUGINS_CONFIG["ruckus_r1_sync"][key]
+    """
+    try:
+        pcfg = getattr(settings, "PLUGINS_CONFIG", {}) or {}
+        mine = pcfg.get("ruckus_r1_sync", {}) or {}
+        return mine.get(key, default)
+    except Exception:
+        return default
+
+
 def _looks_like_mac(s: str) -> bool:
     s = (s or "").strip().lower()
     if len(s) == 17 and s.count(":") == 5 and all(c in "0123456789abcdef:" for c in s):
@@ -104,13 +120,15 @@ def _resolve_config(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> RuckusR1Tena
 
 
 def _make_client(cfg: RuckusR1TenantConfig) -> RuckusR1Client:
+    verify_tls = bool(_plugin_cfg("verify_tls", True))
+    timeout = int(_plugin_cfg("request_timeout", 30))
     return RuckusR1Client(
         base_url=_normalize_base_url(cfg.api_base_url),
         ruckus_tenant_id=cfg.ruckus_tenant_id,
         client_id=cfg.client_id,
         client_secret=cfg.client_secret,
-        verify_tls=True,
-        timeout=30,
+        verify_tls=verify_tls,
+        timeout=timeout,
     )
 
 
@@ -173,37 +191,6 @@ def _get_or_create_site_group(cfg: RuckusR1TenantConfig) -> Optional[SiteGroup]:
     return obj
 
 
-def _get_or_create_site(cfg: RuckusR1TenantConfig, group: Optional[SiteGroup], venue: Dict[str, Any]) -> Site:
-    venue_id = _safe_str(venue.get("id") or venue.get("venueId") or "", 128)
-    venue_name = (venue.get("name") or venue.get("venueName") or venue_id or "Venue").strip()
-    slug = _slugify(f"r1-{venue_id}-{venue_name}")[:100]
-
-    obj = Site.objects.filter(slug=slug).first()
-    if not obj:
-        obj = Site.objects.create(
-            name=venue_name[:100],
-            slug=slug,
-            group=group,
-            tenant=cfg.tenant,
-            status="active",
-            description=f"RUCKUS One Venue {venue_id}",
-        )
-    else:
-        changed = False
-        if obj.name != venue_name[:100]:
-            obj.name = venue_name[:100]
-            changed = True
-        if obj.group_id != (group.id if group else None):
-            obj.group = group
-            changed = True
-        if obj.tenant_id != cfg.tenant_id:
-            obj.tenant = cfg.tenant
-            changed = True
-        if changed:
-            obj.save()
-    return obj
-
-
 def _get_or_create_role(name: str) -> DeviceRole:
     name = (name or "Unknown").strip()
     slug = _slugify(name)
@@ -248,9 +235,23 @@ def _set_device_role_attr(device: Device, role: DeviceRole) -> bool:
     return True
 
 
+def _set_device_location_best_effort(device: Device, location) -> bool:
+    """
+    location is optional; only set if the field exists (it does in NetBox 4.x).
+    """
+    if not hasattr(device, "location"):
+        return False
+    current = getattr(device, "location", None)
+    if (current and location and current.id == location.id) or (current is None and location is None):
+        return False
+    device.location = location
+    return True
+
+
 def _get_or_create_device_infra(
     cfg: RuckusR1TenantConfig,
     site: Site,
+    location,
     role_name: str,
     model: str,
     name: str,
@@ -277,7 +278,11 @@ def _get_or_create_device_infra(
             "status": "active",
         }
         kwargs[_device_role_field_name()] = role
-        return Device.objects.create(**kwargs)
+        obj = Device.objects.create(**kwargs)
+        _set_device_location_best_effort(obj, location)
+        if hasattr(obj, "location") and obj.location_id != (getattr(location, "id", None) if location else None):
+            obj.save()
+        return obj
 
     changed = False
     if obj.tenant_id != cfg.tenant_id:
@@ -296,6 +301,8 @@ def _get_or_create_device_infra(
         obj.name = name
         changed = True
     if _set_device_role_attr(obj, role):
+        changed = True
+    if _set_device_location_best_effort(obj, location):
         changed = True
 
     if changed:
@@ -366,7 +373,12 @@ def _set_primary_ip4_best_effort(device: Device, ip_obj: IPAddress) -> None:
             pass
 
 
-def _upsert_client_as_dcim_device(cfg: RuckusR1TenantConfig, site: Site, cl: Dict[str, Any]) -> Tuple[Optional[Device], Optional[IPAddress]]:
+def _upsert_client_as_dcim_device(
+    cfg: RuckusR1TenantConfig,
+    site: Site,
+    location,
+    cl: Dict[str, Any]
+) -> Tuple[Optional[Device], Optional[IPAddress]]:
     mac = _norm_mac(cl.get("macAddress") or cl.get("mac") or cl.get("clientMac") or "")
     if not _looks_like_mac(mac):
         return (None, None)
@@ -398,6 +410,9 @@ def _upsert_client_as_dcim_device(cfg: RuckusR1TenantConfig, site: Site, cl: Dic
         }
         kwargs[_device_role_field_name()] = role
         obj = Device.objects.create(**kwargs)
+        _set_device_location_best_effort(obj, location)
+        if hasattr(obj, "location"):
+            obj.save()
     else:
         changed = False
         if obj.tenant_id != cfg.tenant_id:
@@ -426,6 +441,9 @@ def _upsert_client_as_dcim_device(cfg: RuckusR1TenantConfig, site: Site, cl: Dic
         if _set_device_role_attr(obj, role):
             changed = True
 
+        if _set_device_location_best_effort(obj, location):
+            changed = True
+
         if changed:
             obj.save()
 
@@ -452,6 +470,7 @@ def _upsert_client_as_dcim_device(cfg: RuckusR1TenantConfig, site: Site, cl: Dic
 def _upsert_wired_client_as_dcim_device(
     cfg: RuckusR1TenantConfig,
     site: Site,
+    location,
     cl: Dict[str, Any],
     *,
     iface_name: str = "eth0",
@@ -486,6 +505,9 @@ def _upsert_wired_client_as_dcim_device(
         }
         kwargs[_device_role_field_name()] = role
         obj = Device.objects.create(**kwargs)
+        _set_device_location_best_effort(obj, location)
+        if hasattr(obj, "location"):
+            obj.save()
     else:
         changed = False
         if obj.tenant_id != cfg.tenant_id:
@@ -508,6 +530,8 @@ def _upsert_wired_client_as_dcim_device(
             if (obj.description or "") != desired_desc[:200]:
                 obj.description = desired_desc[:200]
                 changed = True
+        if _set_device_location_best_effort(obj, location):
+            changed = True
         if changed:
             obj.save()
 
@@ -776,29 +800,19 @@ def _create_wireless_link_best_effort(
     status: str = "active",
     description: str = "",
 ) -> bool:
-    """
-    NetBox 4.5: wireless.WirelessLink uses interface_a/interface_b.
-    We create (or reuse) mesh interfaces on both devices, assign MACs if possible,
-    then create the WirelessLink if it doesn't already exist in either direction.
-
-    Returns True if created, False if already existed or not possible.
-    """
     try:
         WirelessLink = _nb_model("wireless", "WirelessLink")
     except Exception:
         return False
 
-    # Ensure endpoints exist
     a_iface = _ensure_interface(a_device, "mesh")
     b_iface = _ensure_interface(b_device, "mesh")
 
-    # Best-effort MAC assignment to those interfaces
     if a_mac:
         _upsert_macaddress_best_effort(a_iface, a_mac)
     if b_mac:
         _upsert_macaddress_best_effort(b_iface, b_mac)
 
-    # Already exists? (both directions)
     qs = WirelessLink.objects.all()
     if qs.filter(interface_a=a_iface, interface_b=b_iface).exists():
         return False
@@ -811,7 +825,6 @@ def _create_wireless_link_best_effort(
         tenant=cfg.tenant if hasattr(WirelessLink, "tenant") else None,
     )
 
-    # Optional fields (only set if present)
     if hasattr(obj, "ssid") and ssid:
         obj.ssid = ssid[:64]
     if hasattr(obj, "status") and status:
@@ -825,11 +838,12 @@ def _create_wireless_link_best_effort(
     except Exception:
         return False
 
+
 # -----------------
 # Switch ports + wired clients
 # -----------------
 
-def _sync_switch_ports_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, site: Site, venue_id: str) -> Tuple[int, int]:
+def _sync_switch_ports_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, site: Site, location, venue_id: str) -> Tuple[int, int]:
     touched_ifaces = 0
     touched_macs = 0
 
@@ -849,7 +863,7 @@ def _sync_switch_ports_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client,
         if not sw and cfg.allow_stub_devices:
             sw_name = (p.get("switchName") or p.get("switchModel") or switch_unit_id).strip()
             sw_model = (p.get("switchModel") or "Switch").strip()
-            sw = _get_or_create_device_infra(cfg, site, "Switch", sw_model, sw_name or switch_unit_id, serial=switch_unit_id)
+            sw = _get_or_create_device_infra(cfg, site, location, "Switch", sw_model, sw_name or switch_unit_id, serial=switch_unit_id)
 
         if not sw:
             continue
@@ -902,6 +916,7 @@ def _sync_switch_clients_for_venue(
     cfg: RuckusR1TenantConfig,
     api: RuckusR1Client,
     site: Site,
+    location,
     venue_id: str
 ) -> Tuple[int, int, int]:
     processed_clients = 0
@@ -963,7 +978,7 @@ def _sync_switch_clients_for_venue(
         client_dev = None
         client_iface = None
         if mac != "unknown":
-            client_dev, _ = _upsert_wired_client_as_dcim_device(cfg, site, cl, iface_name="eth0")
+            client_dev, _ = _upsert_wired_client_as_dcim_device(cfg, site, location, cl, iface_name="eth0")
             if client_dev:
                 client_iface = _ensure_interface(client_dev, "eth0")
                 touched_ifaces += 1
@@ -985,7 +1000,7 @@ def _sync_switch_clients_for_venue(
 # Topology sync (wired + wireless links)
 # -----------------
 
-def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, site: Site, venue_id: str) -> Tuple[int, int, int, int]:
+def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, site: Site, location, venue_id: str) -> Tuple[int, int, int, int]:
     touched_ifaces = 0
     touched_macs = 0
     touched_cables = 0
@@ -1003,7 +1018,6 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
     nodes = blob.get("nodes") if isinstance(blob.get("nodes"), list) else []
     edges = blob.get("edges") if isinstance(blob.get("edges"), list) else []
 
-    # Nodes -> devices + mgmt MACs/IPs
     for n in nodes:
         if not isinstance(n, dict):
             continue
@@ -1024,7 +1038,7 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
             role = "Device"
             model = model or "Device"
 
-        dev = _get_or_create_device_infra(cfg, site, role, model, name or serial or mac or "device", serial=serial)
+        dev = _get_or_create_device_infra(cfg, site, location, role, model, name or serial or mac or "device", serial=serial)
 
         if ip:
             _upsert_ip(cfg, ip)
@@ -1035,7 +1049,6 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
             if _upsert_macaddress_best_effort(mgmt, mac):
                 touched_macs += 1
 
-    # Edges -> cables + wireless links
     for e in edges:
         if not isinstance(e, dict):
             continue
@@ -1053,7 +1066,6 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
         a_dev = Device.objects.filter(serial=from_serial).first() if from_serial else None
         b_dev = Device.objects.filter(serial=to_serial).first() if to_serial else None
 
-        # MAC-based fallback (common when serials are missing/mismatched)
         if not a_dev and from_mac:
             a_dev = _find_device_by_any_mac(cfg, site, from_mac)
         if not b_dev and to_mac:
@@ -1061,15 +1073,14 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
 
         if not a_dev and cfg.allow_stub_devices:
             stub_serial = from_serial or (_mac_to_serial(from_mac) if _looks_like_mac(from_mac) else "")
-            a_dev = _get_or_create_device_infra(cfg, site, "Device", "Device", from_name or stub_serial or "device", serial=stub_serial)
+            a_dev = _get_or_create_device_infra(cfg, site, location, "Device", "Device", from_name or stub_serial or "device", serial=stub_serial)
         if not b_dev and cfg.allow_stub_devices:
             stub_serial = to_serial or (_mac_to_serial(to_mac) if _looks_like_mac(to_mac) else "")
-            b_dev = _get_or_create_device_infra(cfg, site, "Device", "Device", to_name or stub_serial or "device", serial=stub_serial)
+            b_dev = _get_or_create_device_infra(cfg, site, location, "Device", "Device", to_name or stub_serial or "device", serial=stub_serial)
 
         if not a_dev or not b_dev:
             continue
 
-        # Wired cables
         if ctype == "wired":
             connected_port = (e.get("connectedPort") or "uplink").strip()
             corresponding_port = (e.get("correspondingPort") or "uplink").strip()
@@ -1091,7 +1102,6 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
             if _create_cable(a_iface, b_iface, status="connected"):
                 touched_cables += 1
 
-        # Wireless links (be liberal with types)
         else:
             wireless_types = {"mesh", "wireless", "wirelessmesh", "smartmesh", "apmesh", "ap-mesh", "wireless-mesh"}
             if ctype in wireless_types or "mesh" in ctype or "wireless" in ctype:
@@ -1107,7 +1117,6 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
                 ):
                     touched_wlinks += 1
 
-
     return (touched_ifaces, touched_macs, touched_cables, touched_wlinks)
 
 
@@ -1120,7 +1129,6 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
     if not cfg.enabled:
         return "Config disabled, skipping."
 
-    # Feature toggles (backwards compatible if fields aren't in DB yet)
     do_wlans = _cfg_flag(cfg, "sync_wlans", True)
     do_aps = _cfg_flag(cfg, "sync_aps", True)
     do_switches = _cfg_flag(cfg, "sync_switches", True)
@@ -1129,8 +1137,13 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
     do_wired_clients = _cfg_flag(cfg, "sync_wired_clients", True)
     do_cabling = _cfg_flag(cfg, "sync_cabling", True)
     do_wireless_links = _cfg_flag(cfg, "sync_wireless_links", True)
-    # Placeholder (you can wire this later)
     do_vlans = _cfg_flag(cfg, "sync_vlans", False)
+
+    # Mapping config (plugins.py)
+    mapping_mode = str(_plugin_cfg("venue_mapping_mode", "sites")).strip().lower()
+    parent_site_ref = _plugin_cfg("venue_locations_parent_site", None)
+    child_location_name = str(_plugin_cfg("venue_child_location_name", "Venue"))
+    slug_prefix = str(_plugin_cfg("venue_slug_prefix", "r1"))
 
     api = _make_client(cfg)
     log = _sync_log_start(cfg)
@@ -1143,7 +1156,6 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
             venues = _query_all(api, "/venues/query", {"limit": 500})
             log.venues = len(venues)
 
-            # WLANs (global wifiNetworks)
             if do_wlans:
                 wifi_networks = _query_all(api, "/wifiNetworks/query", {"limit": 500})
                 for wn in wifi_networks:
@@ -1164,7 +1176,22 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
 
             for venue in venues:
                 venue_id = _safe_str(venue.get("id") or venue.get("venueId") or "", 128)
-                site = _get_or_create_site(cfg, site_group, venue)
+                venue_name = (venue.get("name") or venue.get("venueName") or venue_id or "Venue").strip()
+
+                mapping: VenueMapping = map_venue_to_netbox(
+                    venue_id=venue_id,
+                    venue_name=venue_name,
+                    tenant=cfg.tenant,
+                    mode=mapping_mode,
+                    site_group=site_group,
+                    locations_parent_site=parent_site_ref,
+                    child_location_name=child_location_name,
+                    slug_prefix=slug_prefix,
+                )
+
+                # Site/Location for all objects in this venue context
+                site = mapping.device_site
+                location = mapping.device_location
 
                 # APs
                 if do_aps:
@@ -1175,7 +1202,7 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
                         model = (ap.get("model") or ap.get("apModel") or "Access Point").strip()
                         mgmt_ip = (ap.get("ip") or ap.get("ipAddress") or ap.get("mgmtIp") or "").strip()
 
-                        _get_or_create_device_infra(cfg, site, "Access Point", model, name or serial or "AP", serial=serial)
+                        _get_or_create_device_infra(cfg, site, location, "Access Point", model, name or serial or "AP", serial=serial)
                         processed_devices += 1
                         if mgmt_ip and _upsert_ip(cfg, mgmt_ip):
                             processed_ips += 1
@@ -1189,20 +1216,18 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
                         model = (sw.get("model") or sw.get("switchModel") or "Switch").strip()
                         mgmt_ip = (sw.get("ip") or sw.get("ipAddress") or sw.get("mgmtIp") or "").strip()
 
-                        _get_or_create_device_infra(cfg, site, "Switch", model, name or serial or "Switch", serial=serial)
+                        _get_or_create_device_infra(cfg, site, location, "Switch", model, name or serial or "Switch", serial=serial)
                         processed_devices += 1
                         if mgmt_ip and _upsert_ip(cfg, mgmt_ip):
                             processed_ips += 1
 
                 # VLANs (not implemented yet)
                 if do_vlans:
-                    # TODO: implement when you confirm the R1 endpoint(s) and how you want to map VLANs in NetBox
-                    # e.g. ipam.VLAN + VLANGroup per site/venue
                     processed_vlans += 0
 
                 # Switch Ports -> dcim.Interface (+ MACs)
                 if do_interfaces:
-                    it_ports, mt_ports = _sync_switch_ports_for_venue(cfg, api, site, venue_id)
+                    it_ports, mt_ports = _sync_switch_ports_for_venue(cfg, api, site, location, venue_id)
                     processed_ifaces += it_ports
                     processed_macs += mt_ports
 
@@ -1258,13 +1283,13 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
                         )
 
                         if mac != "unknown":
-                            _upsert_client_as_dcim_device(cfg, site, cl)
+                            _upsert_client_as_dcim_device(cfg, site, location, cl)
 
                         processed_clients += 1
 
                 # Switch Clients (wired)
                 if do_wired_clients:
-                    sc, it_sc, ct_sc = _sync_switch_clients_for_venue(cfg, api, site, venue_id)
+                    sc, it_sc, ct_sc = _sync_switch_clients_for_venue(cfg, api, site, location, venue_id)
                     processed_clients += sc
                     processed_ifaces += it_sc
                     if do_cabling:
@@ -1272,7 +1297,7 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
 
                 # Venue topologies (cables + wireless links)
                 if do_cabling or do_wireless_links:
-                    it, mt, ct, wt = _sync_topologies_for_venue(cfg, api, site, venue_id)
+                    it, mt, ct, wt = _sync_topologies_for_venue(cfg, api, site, location, venue_id)
                     processed_ifaces += it
                     processed_macs += mt
                     if do_cabling:
@@ -1298,7 +1323,8 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
                 f"processed_clients={log.clients} duration={(_now() - started).total_seconds():.2f}s "
                 f"(toggles: wlans={do_wlans} aps={do_aps} switches={do_switches} interfaces={do_interfaces} "
                 f"wifi_clients={do_wifi_clients} wired_clients={do_wired_clients} cabling={do_cabling} "
-                f"wireless_links={do_wireless_links} vlans={do_vlans})"
+                f"wireless_links={do_wireless_links} vlans={do_vlans}) "
+                f"(mapping: mode={mapping_mode} parent_site={parent_site_ref} child_location={child_location_name})"
             )
             cfg.save()
 
