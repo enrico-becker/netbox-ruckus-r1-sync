@@ -9,7 +9,7 @@ from netbox.views import generic
 from .forms import RuckusR1TenantConfigForm
 from .models import RuckusR1TenantConfig, RuckusR1SyncLog, RuckusR1Client
 from .tables import RuckusR1TenantConfigTable, RuckusR1SyncLogTable, RuckusR1ClientTable
-from .sync import run_sync_for_tenantconfig
+from .sync import run_sync_for_tenantconfig, _make_client, _query_all
 
 
 class RuckusR1TenantConfigListView(generic.ObjectListView):
@@ -19,6 +19,7 @@ class RuckusR1TenantConfigListView(generic.ObjectListView):
 
 class RuckusR1TenantConfigView(generic.ObjectView):
     queryset = RuckusR1TenantConfig.objects.all()
+    template_name = "ruckus_r1_sync/ruckusr1tenantconfig.html"
     object_fields = (
         ("General", (
             "tenant",
@@ -34,6 +35,9 @@ class RuckusR1TenantConfigView(generic.ObjectView):
             "venue_mapping_mode",
             "venue_child_location_name",
             "venue_locations_parent_site",
+        )),
+        ("Venue Selection", (
+            "venues_selected",
         )),
         ("Sync Options", (
             "authoritative_devices",
@@ -67,6 +71,39 @@ class RuckusR1TenantConfigRunView(View):
             messages.success(request, msg)
         except Exception as e:
             messages.error(request, f"Sync failed: {e}")
+        return redirect("plugins:ruckus_r1_sync:ruckusr1tenantconfig", pk=pk)
+
+
+class RuckusR1TenantConfigRefreshVenuesView(View):
+    """
+    Fetch venues from RUCKUS One and store them in cfg.venues_cache.
+    New venues will automatically appear on the left side of the dual list selector.
+    """
+    def post(self, request, pk):
+        cfg = get_object_or_404(RuckusR1TenantConfig, pk=pk)
+        try:
+            api = _make_client(cfg)
+            venues = _query_all(api, "/venues/query", {"limit": 500})
+            cache = []
+            for v in venues:
+                if not isinstance(v, dict):
+                    continue
+                vid = (v.get("id") or v.get("venueId") or "").strip()
+                name = (v.get("name") or v.get("venueName") or vid or "").strip()
+                if not vid:
+                    continue
+                cache.append({"id": vid, "name": name})
+
+            # stable sort
+            cache.sort(key=lambda x: ((x.get("name") or "").lower(), x.get("id") or ""))
+
+            cfg.venues_cache = cache
+            cfg.save()
+
+            messages.success(request, f"Venues refreshed: {len(cache)} found.")
+        except Exception as e:
+            messages.error(request, f"Refresh venues failed: {e}")
+
         return redirect("plugins:ruckus_r1_sync:ruckusr1tenantconfig", pk=pk)
 
 

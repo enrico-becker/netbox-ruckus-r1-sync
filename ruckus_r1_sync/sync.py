@@ -1154,6 +1154,12 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
             site_group = _get_or_create_site_group(cfg)
 
             venues = _query_all(api, "/venues/query", {"limit": 500})
+            # Venue Roadmap: Filter by selected venues (empty => all)
+            selected_ids = getattr(cfg, "venues_selected", None) or []
+            selected_ids = {str(x).strip() for x in selected_ids if str(x).strip()}
+            if selected_ids:
+                venues = [v for v in venues if str((v.get("id") or v.get("venueId") or "")).strip() in selected_ids]
+
             log.venues = len(venues)
 
             if do_wlans:

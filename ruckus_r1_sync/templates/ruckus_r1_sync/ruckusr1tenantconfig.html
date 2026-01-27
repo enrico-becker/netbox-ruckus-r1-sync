@@ -11,6 +11,17 @@
   </form>
   
 {% endblock %}
+
+{% block extra_controls %}
+  {{ block.super }}
+  <form method="post"
+        action="{% url 'plugins:ruckus_r1_sync:ruckusr1tenantconfig_refresh_venues' pk=object.pk %}"
+        class="d-inline">
+    {% csrf_token %}
+    <button type="submit" class="btn btn-primary">Refresh Venues</button>
+  </form>
+{% endblock extra_controls %}
+
 {% block content %}
 <div class="row">
   <div class="col col-md-10">

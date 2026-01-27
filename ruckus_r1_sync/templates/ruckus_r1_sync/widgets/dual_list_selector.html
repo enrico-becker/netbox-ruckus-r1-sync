@@ -1,0 +1,43 @@
+{% load static %}
+
+<div class="dual-list-selector" data-duallist>
+  {# Hidden select: contains ALL choices (CSP-safe, no inline JS needed) #}
+  <select multiple class="d-none" data-duallist-all>
+    {% for group, options, index in widget.optgroups %}
+      {% for option in options %}
+        <option value="{{ option.value }}">{{ option.label }}</option>
+      {% endfor %}
+    {% endfor %}
+  </select>
+
+  <div class="row g-2">
+    <div class="col-md-5">
+      <label class="form-label">Available Venues</label>
+      <select multiple class="form-select" size="14" data-duallist-available></select>
+      <div class="form-text">New Venues appear here after “Refresh Venues”.</div>
+    </div>
+
+    <div class="col-md-2 d-flex flex-column align-items-stretch justify-content-center gap-2">
+      <button type="button" class="btn btn-outline-secondary" data-duallist-add>&gt;</button>
+      <button type="button" class="btn btn-outline-secondary" data-duallist-remove>&lt;</button>
+      <button type="button" class="btn btn-outline-secondary" data-duallist-addall>&gt;&gt;</button>
+      <button type="button" class="btn btn-outline-secondary" data-duallist-removeall>&lt;&lt;</button>
+    </div>
+
+    <div class="col-md-5">
+      <label class="form-label">Selected for Sync</label>
+      <select name="{{ widget.name }}" multiple class="form-select" size="14" data-duallist-selected>
+        {% for group, options, index in widget.optgroups %}
+          {% for option in options %}
+            {% if option.selected %}
+              <option value="{{ option.value }}" selected>{{ option.label }}</option>
+            {% endif %}
+          {% endfor %}
+        {% endfor %}
+      </select>
+      <div class="form-text">Leave empty to sync ALL venues.</div>
+    </div>
+  </div>
+</div>
+
+<script src="{% static 'ruckus_r1_sync/dual_list_selector.js' %}"></script>

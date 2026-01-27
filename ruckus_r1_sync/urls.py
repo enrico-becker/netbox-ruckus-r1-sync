@@ -23,6 +23,7 @@ urlpatterns = [
     ),
 
     path("configs/<int:pk>/run/", views.RuckusR1TenantConfigRunView.as_view(), name="ruckusr1tenantconfig_run"),
+    path("configs/<int:pk>/refresh-venues/", views.RuckusR1TenantConfigRefreshVenuesView.as_view(), name="ruckusr1tenantconfig_refresh_venues"),
 
     path("logs/", views.RuckusR1SyncLogListView.as_view(), name="ruckusr1synclog_list"),
     path("clients/", views.RuckusR1ClientListView.as_view(), name="ruckusr1client_list"),

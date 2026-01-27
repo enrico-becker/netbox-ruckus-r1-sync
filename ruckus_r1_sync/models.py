@@ -56,7 +56,7 @@ class RuckusR1TenantConfig(NetBoxModel):
     sync_wired_clients = models.BooleanField(default=True)
     sync_cabling = models.BooleanField(default=True)
     sync_wireless_links = models.BooleanField(default=True)
-    sync_vlans = models.BooleanField(default=False)  # wenn du VLAN später implementierst
+    sync_vlans = models.BooleanField(default=False)
     authoritative_devices = models.BooleanField(default=False)
     authoritative_interfaces = models.BooleanField(default=False)
     authoritative_ips = models.BooleanField(default=False)
@@ -91,6 +91,18 @@ class RuckusR1TenantConfig(NetBoxModel):
         help_text="Required only when mapping mode is 'locations'. Devices will be placed in this site and the venue becomes a Location.",
     )
 
+    # --- Venue Roadmap (neu) ---
+    venues_cache = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Cached Venues from RUCKUS One (list of {id,name}). Use 'Refresh Venues' button to update.",
+    )
+    venues_selected = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Venue IDs selected for sync. Empty list means: sync ALL venues.",
+    )
+
     last_sync = models.DateTimeField(null=True, blank=True)
     last_sync_status = models.CharField(max_length=32, default="never", blank=True)
     last_sync_message = models.TextField(default="", blank=True)
@@ -106,7 +118,6 @@ class RuckusR1TenantConfig(NetBoxModel):
         return f"{self.name} (Mandant: {self.tenant})"
 
     def get_absolute_url(self):
-        # IMPORTANT: must match urls.py name
         return reverse("plugins:ruckus_r1_sync:ruckusr1tenantconfig", kwargs={"pk": self.pk})
 
 
