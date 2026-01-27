@@ -1,67 +1,67 @@
 # NetBox RUCKUS One Sync Plugin (`ruckus_r1_sync`)
 
-Dieses NetBox-Plugin synchronisiert Inventar-, WLAN- und Client-Daten aus **RUCKUS One (Cloud)** nach **NetBox**.  
-Es richtet sich an Systemintegratoren, Betreiber und Hersteller-SEs, die RUCKUS-Umgebungen strukturiert dokumentieren und automatisiert aktuell halten wollen.
+This NetBox plugin synchronizes inventory, WLAN, and client data from **RUCKUS One (Cloud)** into **NetBox**.  
+It is designed for system integrators, operators, and vendor SEs who want to document and maintain RUCKUS environments in a structured and automated way.
 
 ---
 
-## ✨ Features (aktueller Stand)
+## ✨ Features (current status)
 
-### 🔄 Synchronisation
+### 🔄 Synchronization
 - RUCKUS One Venues
 - Access Points
 - Switches
 - Interfaces
 - WLANs
-- WLAN- & Wired-Clients
-- Cabling / Links (optional, authoritativ)
-- Multi-Tenant-fähig (NetBox Tenants)
+- Wireless & wired clients
+- Cabling / links (optional, authoritative)
+- Multi-tenant capable (NetBox Tenants)
 
 ---
 
-### 🗺️ Venue Mapping Roadmap (implementiert)
+### 🗺️ Venue Mapping Roadmap (implemented)
 
-Venues aus RUCKUS One können flexibel in NetBox abgebildet werden:
+Venues from RUCKUS One can be flexibly mapped into NetBox:
 
-| Modus | Beschreibung |
+| Mode | Description |
 |------|-------------|
-| `sites` | Jede Venue wird ein **NetBox Site** |
-| `locations` | Jede Venue wird eine **Location** unter einem bestehenden Parent-Site |
-| `both` | Venue wird ein **Site** + darunter eine **Location** |
+| `sites` | Each venue is created as a **NetBox Site** |
+| `locations` | Each venue is created as a **Location** under an existing parent site |
+| `both` | The venue is created as a **Site** with a **Location** underneath |
 
-Konfigurierbar **pro Tenant** über die UI.
-
----
-
-### 🎯 Venue Selection Roadmap (implementiert)
-
-- Venues können **gezielt für den Sync ausgewählt** werden
-- Komfortable **Dual-List UI**:
-  - links: *Available Venues*
-  - rechts: *Selected for Sync*
-- **Leere Auswahl = alle Venues synchronisieren** (Default-Verhalten)
-- Neue Venues aus RUCKUS One erscheinen automatisch links
-- Auswahl wird persistent gespeichert
+Configurable **per tenant** via the UI.
 
 ---
 
-## 🧩 Voraussetzungen
+### 🎯 Venue Selection Roadmap (implemented)
+
+- Venues can be **explicitly selected** for synchronization
+- User-friendly **dual-list selector UI**:
+  - left: *Available Venues*
+  - right: *Selected for Sync*
+- **Empty selection = sync ALL venues** (default behavior)
+- New venues from RUCKUS One automatically appear in the available list
+- Selection is persisted per tenant
+
+---
+
+## 🧩 Requirements
 
 - NetBox **4.5.x**
 - Docker / netbox-docker
-- RUCKUS One Tenant
-- Python 3.12 (NetBox Standard)
+- RUCKUS One tenant
+- Python 3.12 (NetBox default)
 
 ---
 
 ## 📦 Installation
 
-### 1. Plugin ins NetBox-Plugins-Verzeichnis legen
+### 1. Place the plugin into the NetBox plugins directory
 ```bash
 /plugins/netbox-ruckus-r1-sync/
 ```
 
-### 2. Plugin aktivieren
+### 2. Enable the plugin
 
 `configuration/plugins.py`:
 
@@ -80,38 +80,38 @@ PLUGINS_CONFIG = {
 
 ---
 
-### 3. Migrationen ausführen
+### 3. Run database migrations
 ```bash
 docker compose exec netbox bash -lc "python manage.py migrate ruckus_r1_sync"
 ```
 
 ---
 
-### 4. Static Files einsammeln (wichtig!)
+### 4. Collect static files (important!)
 ```bash
 docker compose exec -u root netbox bash -lc "python manage.py collectstatic --no-input"
 ```
 
 ---
 
-### 5. NetBox neu starten
+### 5. Restart NetBox
 ```bash
 docker compose restart netbox netbox-worker
 ```
 
 ---
 
-## ⚙️ Konfiguration (UI)
+## ⚙️ Configuration (UI)
 
-Pfad:
+Path:
 ```
 Plugins → RUCKUS R1 Sync → Tenant Configs
 ```
 
-### Wichtige Felder
+### Key settings
 
 #### RUCKUS API
-- **API Base URL** – Region (EU/US/APAC)
+- **API Base URL** – region (EU / US / APAC)
 - **Tenant ID**
 - **Client ID / Client Secret**
 
@@ -120,34 +120,34 @@ Plugins → RUCKUS R1 Sync → Tenant Configs
   - `sites`
   - `locations`
   - `both`
-- **Parent Site** (nur bei `locations`)
-- **Child Location Name** (nur bei `both`)
+- **Parent Site** (required for `locations`)
+- **Child Location Name** (used for `both`)
 
 #### Venue Selection
 - **Venues selected for Sync**
-  - leer = alle Venues
-  - Auswahl per Dual-List Selector
+  - empty = sync all venues
+  - selection via dual-list selector
 
 ---
 
-## 🧠 Wichtige Logik
+## 🧠 Important behavior
 
-- **Keine Venue ausgewählt** → alle Venues werden synchronisiert
-- **Venues ausgewählt** → nur diese werden synchronisiert
-- Mapping & Selection gelten **pro Tenant**
-- Refresh Venues lädt Metadaten aus RUCKUS One, ohne Sync auszulösen
+- **No venue selected** → all venues are synchronized
+- **Specific venues selected** → only those venues are synchronized
+- Mapping and selection are applied **per tenant**
+- “Refresh Venues” only updates metadata from RUCKUS One and does **not** trigger a sync
 
 ---
 
 ## 🔍 Debug / Checks
 
-### Venue Cache prüfen
+### Check venue cache
 ```bash
 docker compose exec netbox bash -lc "python manage.py shell -c \
 \"from ruckus_r1_sync.models import RuckusR1TenantConfig as C; c=C.objects.first(); print(len(c.venues_cache))\""
 ```
 
-### Ausgewählte Venues prüfen
+### Check selected venues
 ```bash
 docker compose exec netbox bash -lc "python manage.py shell -c \
 \"from ruckus_r1_sync.models import RuckusR1TenantConfig as C; c=C.objects.first(); print(c.venues_selected)\""
@@ -155,17 +155,16 @@ docker compose exec netbox bash -lc "python manage.py shell -c \
 
 ---
 
-## 🚧 Roadmap (Ausblick)
+## 🚧 Roadmap (outlook)
 
-- Dry-Run Sync
-- Delta-Sync pro Venue
-- Sync-Log mit Venue-Filter
-- Bulk-Actions ("Sync only this Venue")
-- API-basierte Steuerung
+- Dry-run synchronization
+- Per-venue delta sync
+- Sync logs with venue filtering
+- Bulk actions (e.g. “Sync only this venue”)
+- API-based control
 
 ---
 
-## 👤 Autor
+## 👤 Author
 
 Enrico Becker  
-System Engineer – RUCKUS Networks  
