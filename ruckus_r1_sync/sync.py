@@ -11,12 +11,11 @@ from django.db import transaction
 from django.utils import timezone
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site, SiteGroup
-from ipam.models import IPAddress
+from ipam.models import IPAddress, VLAN
 from wireless.models import WirelessLAN
 
 from .models import RuckusR1TenantConfig, RuckusR1SyncLog, RuckusR1Client as RuckusR1ClientModel
 from .ruckus_api import RuckusR1Client
-
 from .mapping import map_venue_to_netbox, VenueMapping
 
 
@@ -329,6 +328,48 @@ def _upsert_ip(cfg: RuckusR1TenantConfig, ip: str) -> Optional[IPAddress]:
     obj = IPAddress.objects.filter(address=ip, tenant=cfg.tenant).first()
     if not obj:
         obj = IPAddress.objects.create(address=ip, tenant=cfg.tenant, status="active")
+    return obj
+
+
+def _upsert_vlan(cfg: RuckusR1TenantConfig, site: Site, vid: int, name: str = "") -> Optional[VLAN]:
+    """
+    Create/update NetBox VLANs.
+    - We scope VLANs to the Site (because in many R1 deployments VLAN IDs repeat across venues).
+    - If your NetBox uses global VLANs instead, remove `site=site` from the filters.
+    """
+    try:
+        vid = int(vid)
+    except Exception:
+        return None
+    if vid <= 0 or vid > 4094:
+        return None
+
+    name = (name or f"VLAN {vid}").strip()[:64]
+
+    qs = VLAN.objects.filter(tenant=cfg.tenant, vid=vid)
+    if "site" in {f.name for f in VLAN._meta.get_fields()}:
+        qs = qs.filter(site=site)
+
+    obj = qs.first()
+    if not obj:
+        kwargs = {"tenant": cfg.tenant, "vid": vid, "name": name}
+        if "site" in {f.name for f in VLAN._meta.get_fields()}:
+            kwargs["site"] = site
+        obj = VLAN.objects.create(**kwargs)
+        return obj
+
+    changed = False
+    if obj.name != name:
+        obj.name = name
+        changed = True
+    if hasattr(obj, "tenant_id") and obj.tenant_id != cfg.tenant_id:
+        obj.tenant = cfg.tenant
+        changed = True
+    if "site" in {f.name for f in VLAN._meta.get_fields()} and obj.site_id != site.id:
+        obj.site = site
+        changed = True
+    if changed:
+        obj.save()
     return obj
 
 
@@ -843,13 +884,18 @@ def _create_wireless_link_best_effort(
 # Switch ports + wired clients
 # -----------------
 
-def _sync_switch_ports_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, site: Site, location, venue_id: str) -> Tuple[int, int]:
+def _sync_switch_ports_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, site: Site, location, venue_id: str) -> Tuple[int, int, int]:
+    """
+    Returns: (touched_ifaces, touched_macs, touched_vlans)
+    VLANs are inferred from switch port VLAN fields (vlanIds/unTaggedVlan/accessVlan/managementTrafficVlan).
+    """
     touched_ifaces = 0
     touched_macs = 0
+    touched_vlans = 0
 
     rows = _query_all(api, "/venues/switches/switchPorts/query", {"venueId": venue_id, "limit": 5000})
     if not rows:
-        return (0, 0)
+        return (0, 0, 0)
 
     for p in rows:
         if not isinstance(p, dict):
@@ -885,6 +931,39 @@ def _sync_switch_ports_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client,
         speed_kbps = _capacity_to_kbps(p.get("portSpeedCapacity") or "") or _parse_link_speed_to_kbps(p.get("portSpeed") or "")
         poe_enabled = p.get("poeEnabled")
 
+        # VLAN inference
+        vids: List[int] = []
+        for key in ("unTaggedVlan", "accessVlan", "nativeVlan", "managementTrafficVlan"):
+            v = p.get(key)
+            try:
+                if v is not None and str(v).strip() != "":
+                    vids.append(int(str(v).strip()))
+            except Exception:
+                pass
+
+        vlan_ids = p.get("vlanIds")
+        if isinstance(vlan_ids, list):
+            for v in vlan_ids:
+                try:
+                    vids.append(int(str(v).strip()))
+                except Exception:
+                    pass
+        elif isinstance(vlan_ids, str):
+            # e.g. "1,10,20"
+            for part in vlan_ids.replace(";", ",").split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    vids.append(int(part))
+                except Exception:
+                    pass
+
+        # Dedup + create
+        for vid in sorted({v for v in vids if isinstance(v, int)}):
+            if _upsert_vlan(cfg, site, vid):
+                touched_vlans += 1
+
         desc_parts = []
         if p.get("tags"):
             desc_parts.append(str(p["tags"]))
@@ -909,7 +988,7 @@ def _sync_switch_ports_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client,
             description=" | ".join(desc_parts).strip(),
         )
 
-    return (touched_ifaces, touched_macs)
+    return (touched_ifaces, touched_macs, touched_vlans)
 
 
 def _sync_switch_clients_for_venue(
@@ -1203,39 +1282,53 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
                 if do_aps:
                     aps = _query_all(api, "/venues/aps/query", {"venueId": venue_id, "limit": 1000})
                     for ap in aps:
-                        name = (ap.get("name") or ap.get("apName") or ap.get("hostname") or ap.get("serial") or "").strip()
-                        serial = (ap.get("serial") or ap.get("msn") or ap.get("serialNumber") or ap.get("apSerial") or ap.get("deviceSerial") or "").strip()
+                        name = (ap.get("name") or ap.get("apName") or ap.get("hostname") or ap.get("serial") or ap.get("serialNumber") or "").strip()
+                        serial = (ap.get("serialNumber") or ap.get("serial") or ap.get("msn") or ap.get("serialNumber") or ap.get("apSerial") or ap.get("deviceSerial") or "").strip()
                         model = (ap.get("model") or ap.get("apModel") or "Access Point").strip()
-                        mgmt_ip = (ap.get("ip") or ap.get("ipAddress") or ap.get("mgmtIp") or "").strip()
+
+                        # R1: mgmt IP typically lives under networkStatus.ipAddress
+                        ns = ap.get("networkStatus") or {}
+                        mgmt_ip = (ns.get("ipAddress") or ap.get("ip") or ap.get("ipAddress") or ap.get("mgmtIp") or "").strip()
 
                         _get_or_create_device_infra(cfg, site, location, "Access Point", model, name or serial or "AP", serial=serial)
                         processed_devices += 1
+
                         if mgmt_ip and _upsert_ip(cfg, mgmt_ip):
                             processed_ips += 1
+
+                        # also create mgmt VLAN if present
+                        if do_vlans:
+                            try:
+                                mv = ns.get("managementTrafficVlan")
+                                if mv is not None and str(mv).strip() != "":
+                                    if _upsert_vlan(cfg, site, int(str(mv).strip()), name=f"MGMT VLAN {mv}"):
+                                        processed_vlans += 1
+                            except Exception:
+                                pass
 
                 # Switches
                 if do_switches:
                     switches = _query_all(api, "/venues/switches/query", {"venueId": venue_id, "limit": 1000})
                     for sw in switches:
-                        name = (sw.get("name") or sw.get("switchName") or sw.get("hostname") or sw.get("serial") or "").strip()
-                        serial = (sw.get("serial") or sw.get("msn") or sw.get("serialNumber") or sw.get("switchSerial") or sw.get("deviceSerial") or "").strip()
+                        name = (sw.get("name") or sw.get("switchName") or sw.get("hostname") or sw.get("serial") or sw.get("serialNumber") or "").strip()
+                        serial = (sw.get("serialNumber") or sw.get("serial") or sw.get("msn") or sw.get("switchSerial") or sw.get("deviceSerial") or "").strip()
                         model = (sw.get("model") or sw.get("switchModel") or "Switch").strip()
-                        mgmt_ip = (sw.get("ip") or sw.get("ipAddress") or sw.get("mgmtIp") or "").strip()
+
+                        ns = sw.get("networkStatus") or {}
+                        mgmt_ip = (ns.get("ipAddress") or sw.get("ip") or sw.get("ipAddress") or sw.get("mgmtIp") or "").strip()
 
                         _get_or_create_device_infra(cfg, site, location, "Switch", model, name or serial or "Switch", serial=serial)
                         processed_devices += 1
                         if mgmt_ip and _upsert_ip(cfg, mgmt_ip):
                             processed_ips += 1
 
-                # VLANs (not implemented yet)
-                if do_vlans:
-                    processed_vlans += 0
-
-                # Switch Ports -> dcim.Interface (+ MACs)
+                # Switch Ports -> dcim.Interface (+ MACs) + VLAN inference
                 if do_interfaces:
-                    it_ports, mt_ports = _sync_switch_ports_for_venue(cfg, api, site, location, venue_id)
+                    it_ports, mt_ports, vt_ports = _sync_switch_ports_for_venue(cfg, api, site, location, venue_id)
                     processed_ifaces += it_ports
                     processed_macs += mt_ports
+                    if do_vlans:
+                        processed_vlans += vt_ports
 
                 # Wi-Fi Clients
                 if do_wifi_clients:
