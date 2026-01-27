@@ -69,20 +69,26 @@ class RuckusR1TenantConfigForm(NetBoxModelForm):
         if cur and cur not in dict(API_BASE_URL_CHOICES):
             self.fields["api_base_url"].choices = ((cur, cur),) + API_BASE_URL_CHOICES
 
-        # UX: help texts
+        # UX: help text
         self.fields["venue_child_location_name"].help_text = _(
             "Used only when mapping mode is 'both' (Location name created under the Venue Site)."
         )
 
     def clean(self):
+        # NetBox may return None here; in that case we MUST preserve existing cleaned_data
         cleaned = super().clean()
+        if cleaned is None:
+            cleaned = self.cleaned_data
 
         mode = (cleaned.get("venue_mapping_mode") or "").strip().lower()
         parent_site = cleaned.get("venue_locations_parent_site")
         child_name = (cleaned.get("venue_child_location_name") or "").strip()
 
         if mode == RuckusR1TenantConfig.VENUE_MAPPING_LOCATIONS and not parent_site:
-            self.add_error("venue_locations_parent_site", _("This field is required when mapping mode is 'locations'."))
+            self.add_error(
+                "venue_locations_parent_site",
+                _("This field is required when mapping mode is 'locations'."),
+            )
 
         if mode == RuckusR1TenantConfig.VENUE_MAPPING_BOTH:
             cleaned["venue_child_location_name"] = child_name or "Venue"
