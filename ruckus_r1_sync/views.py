@@ -30,6 +30,11 @@ class RuckusR1TenantConfigView(generic.ObjectView):
             "ruckus_tenant_id",
             "client_id",
         )),
+        ("Venue Mapping", (
+            "venue_mapping_mode",
+            "venue_child_location_name",
+            "venue_locations_parent_site",
+        )),
         ("Sync Options", (
             "authoritative_devices",
             "authoritative_interfaces",

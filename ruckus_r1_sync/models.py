@@ -2,12 +2,24 @@ from __future__ import annotations
 
 from django.db import models
 from django.urls import reverse
+from dcim.models import Site
 
 from netbox.models import NetBoxModel
 from tenancy.models import Tenant
 
 
 class RuckusR1TenantConfig(NetBoxModel):
+    # --- Venue mapping (neu) ---
+    VENUE_MAPPING_SITES = "sites"
+    VENUE_MAPPING_LOCATIONS = "locations"
+    VENUE_MAPPING_BOTH = "both"
+
+    VENUE_MAPPING_CHOICES = (
+        (VENUE_MAPPING_SITES, "Sites (Venue → Site)"),
+        (VENUE_MAPPING_LOCATIONS, "Locations (Venue → Location under Parent Site)"),
+        (VENUE_MAPPING_BOTH, "Both (Venue → Site + child Location)"),
+    )
+
     tenant = models.OneToOneField(
         to=Tenant,
         on_delete=models.CASCADE,
@@ -55,6 +67,29 @@ class RuckusR1TenantConfig(NetBoxModel):
     default_site_group = models.CharField(max_length=200, default="", blank=True)
     default_device_role = models.CharField(max_length=200, default="", blank=True)
     default_manufacturer = models.CharField(max_length=200, default="RUCKUS", blank=True)
+
+    # --- Venue mapping config (neu) ---
+    venue_mapping_mode = models.CharField(
+        max_length=20,
+        choices=VENUE_MAPPING_CHOICES,
+        default=VENUE_MAPPING_SITES,
+    )
+
+    venue_child_location_name = models.CharField(
+        max_length=100,
+        blank=True,
+        default="Venue",
+        help_text="Used only when mapping mode is 'both' (child location name under the venue site).",
+    )
+
+    venue_locations_parent_site = models.ForeignKey(
+        to=Site,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="ruckus_r1_sync_parent_site_configs",
+        help_text="Required only when mapping mode is 'locations'. Devices will be placed in this site and the venue becomes a Location.",
+    )
 
     last_sync = models.DateTimeField(null=True, blank=True)
     last_sync_status = models.CharField(max_length=32, default="never", blank=True)

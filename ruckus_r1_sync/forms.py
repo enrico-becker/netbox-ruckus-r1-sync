@@ -3,7 +3,9 @@ from __future__ import annotations
 from django import forms
 from django.utils.translation import gettext_lazy as _
 
+from dcim.models import Site
 from netbox.forms import NetBoxModelForm
+
 from .models import RuckusR1TenantConfig
 
 
@@ -21,6 +23,12 @@ class RuckusR1TenantConfigForm(NetBoxModelForm):
         required=True,
     )
 
+    venue_locations_parent_site = forms.ModelChoiceField(
+        label=_("Parent Site (required for 'locations' mode)"),
+        queryset=Site.objects.all().order_by("name"),
+        required=False,
+    )
+
     class Meta:
         model = RuckusR1TenantConfig
         fields = (
@@ -32,7 +40,10 @@ class RuckusR1TenantConfigForm(NetBoxModelForm):
             "client_secret",
             "enabled",
 
-
+            # --- Mapping Roadmap (neu) ---
+            "venue_mapping_mode",
+            "venue_child_location_name",
+            "venue_locations_parent_site",
 
             # authoritativeness + stubs
             "allow_stub_devices",
@@ -57,3 +68,23 @@ class RuckusR1TenantConfigForm(NetBoxModelForm):
         cur = getattr(self.instance, "api_base_url", None)
         if cur and cur not in dict(API_BASE_URL_CHOICES):
             self.fields["api_base_url"].choices = ((cur, cur),) + API_BASE_URL_CHOICES
+
+        # UX: help texts
+        self.fields["venue_child_location_name"].help_text = _(
+            "Used only when mapping mode is 'both' (Location name created under the Venue Site)."
+        )
+
+    def clean(self):
+        cleaned = super().clean()
+
+        mode = (cleaned.get("venue_mapping_mode") or "").strip().lower()
+        parent_site = cleaned.get("venue_locations_parent_site")
+        child_name = (cleaned.get("venue_child_location_name") or "").strip()
+
+        if mode == RuckusR1TenantConfig.VENUE_MAPPING_LOCATIONS and not parent_site:
+            self.add_error("venue_locations_parent_site", _("This field is required when mapping mode is 'locations'."))
+
+        if mode == RuckusR1TenantConfig.VENUE_MAPPING_BOTH:
+            cleaned["venue_child_location_name"] = child_name or "Venue"
+
+        return cleaned
