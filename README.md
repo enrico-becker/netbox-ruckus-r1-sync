@@ -1,177 +1,171 @@
-# NetBox RUCKUS R1 Sync Plugin
+# NetBox RUCKUS One Sync Plugin (`ruckus_r1_sync`)
 
-A NetBox plugin to synchronize data from **RUCKUS One (R1)** into NetBox.
-
-This plugin is designed for documentation and inventory use cases and supports
-Docker-based NetBox installations (netbox-docker).
+Dieses NetBox-Plugin synchronisiert Inventar-, WLAN- und Client-Daten aus **RUCKUS One (Cloud)** nach **NetBox**.  
+Es richtet sich an Systemintegratoren, Betreiber und Hersteller-SEs, die RUCKUS-Umgebungen strukturiert dokumentieren und automatisiert aktuell halten wollen.
 
 ---
 
-## Features
+## ✨ Features (aktueller Stand)
 
-- Synchronization from **RUCKUS One Public API**
-- Import of:
-  - Venues / Networks
-  - Devices (Access Points, Switches)
-  - VLANs
-  - Interfaces and basic cabling relationships (where available)
-- Tenant-aware imports
-- Optional authoritative mode
-- CLI-based synchronization
-- NetBox v4 compatible (`netbox.plugins`) 
-
----
-
-## Repository
-
-https://github.com/enrico-becker/netbox-ruckus-r1-sync
+### 🔄 Synchronisation
+- RUCKUS One Venues
+- Access Points
+- Switches
+- Interfaces
+- WLANs
+- WLAN- & Wired-Clients
+- Cabling / Links (optional, authoritativ)
+- Multi-Tenant-fähig (NetBox Tenants)
 
 ---
 
-## Requirements
+### 🗺️ Venue Mapping Roadmap (implementiert)
 
-- NetBox **v4.x**
-- Python **3.10+**
-- Docker & Docker Compose
-- RUCKUS One API token
+Venues aus RUCKUS One können flexibel in NetBox abgebildet werden:
+
+| Modus | Beschreibung |
+|------|-------------|
+| `sites` | Jede Venue wird ein **NetBox Site** |
+| `locations` | Jede Venue wird eine **Location** unter einem bestehenden Parent-Site |
+| `both` | Venue wird ein **Site** + darunter eine **Location** |
+
+Konfigurierbar **pro Tenant** über die UI.
 
 ---
 
-## Installation (Docker / netbox-docker)
+### 🎯 Venue Selection Roadmap (implementiert)
 
-### 1. Clone the plugin
+- Venues können **gezielt für den Sync ausgewählt** werden
+- Komfortable **Dual-List UI**:
+  - links: *Available Venues*
+  - rechts: *Selected for Sync*
+- **Leere Auswahl = alle Venues synchronisieren** (Default-Verhalten)
+- Neue Venues aus RUCKUS One erscheinen automatisch links
+- Auswahl wird persistent gespeichert
 
+---
+
+## 🧩 Voraussetzungen
+
+- NetBox **4.5.x**
+- Docker / netbox-docker
+- RUCKUS One Tenant
+- Python 3.12 (NetBox Standard)
+
+---
+
+## 📦 Installation
+
+### 1. Plugin ins NetBox-Plugins-Verzeichnis legen
 ```bash
-cd netbox-docker/plugins
-git clone https://github.com/enrico-becker/netbox-ruckus-r1-sync.git
+/plugins/netbox-ruckus-r1-sync/
 ```
 
-Resulting structure:
+### 2. Plugin aktivieren
 
-```text
-netbox-docker/
-└── plugins/
-    └── netbox-ruckus-r1-sync/
-        ├── netbox_plugin_ruckus_r1_sync/
-        ├── pyproject.toml
-        └── README.md
-```
-
----
-
-### 2. Add plugin to `plugin_requirements.txt`
-
-In your **netbox-docker** root directory, edit or create `plugin_requirements.txt`:
-
-```text
-plugins/netbox-ruckus-r1-sync
-```
-
----
-
-### 3. Enable the plugin
-
-Edit `configuration/plugins.py`:
+`configuration/plugins.py`:
 
 ```python
 PLUGINS = [
-    "netbox_plugin_ruckus_r1_sync",
+    "ruckus_r1_sync",
 ]
 
 PLUGINS_CONFIG = {
-    "netbox_plugin_ruckus_r1_sync": {
-        "api_base_url": "https://api.ruckus.cloud",
-        "api_token": "YOUR_RUCKUS_ONE_API_TOKEN",
-        "default_tenant": None,
-        "authoritative": False,
-        "allow_stub_devices": True,
+    "ruckus_r1_sync": {
+        "verify_tls": True,
+        "request_timeout": 30,
     }
 }
 ```
 
 ---
 
-### 4. Build and start NetBox
-
+### 3. Migrationen ausführen
 ```bash
-docker compose build
-docker compose up -d
-```
-
-Verify plugin loading:
-
-```bash
-docker compose logs netbox | grep ruckus
+docker compose exec netbox bash -lc "python manage.py migrate ruckus_r1_sync"
 ```
 
 ---
 
-## Running a Sync
-
-The plugin provides a Django management command.
-
-Basic sync:
-
+### 4. Static Files einsammeln (wichtig!)
 ```bash
-docker compose exec netbox python manage.py ruckus_r1_sync
-```
-
-Example with options:
-
-```bash
-docker compose exec netbox python manage.py ruckus_r1_sync \
-  --tenant-id 11 \
-  --authoritative
+docker compose exec -u root netbox bash -lc "python manage.py collectstatic --no-input"
 ```
 
 ---
 
-## Configuration Options
-
-| Option | Description |
-|------|------------|
-| `api_base_url` | RUCKUS One API base URL |
-| `api_token` | API authentication token |
-| `default_tenant` | Fallback tenant ID |
-| `authoritative` | Overwrite NetBox objects |
-| `allow_stub_devices` | Create placeholder devices |
+### 5. NetBox neu starten
+```bash
+docker compose restart netbox netbox-worker
+```
 
 ---
 
-## Development Notes
+## ⚙️ Konfiguration (UI)
 
-- Compatible with NetBox v4+
-- Uses `netbox.plugins`
-- Does not override global navigation or dashboard routes
-- Safe for multi-tenant environments
+Pfad:
+```
+Plugins → RUCKUS R1 Sync → Tenant Configs
+```
 
----
+### Wichtige Felder
 
-## Roadmap
+#### RUCKUS API
+- **API Base URL** – Region (EU/US/APAC)
+- **Tenant ID**
+- **Client ID / Client Secret**
 
-- Full interface and cable relationship sync
-- WLAN / SSID objects
-- Scheduled sync jobs
-- Web-based configuration UI
-- Extended statistics and client data (optional)
+#### Venue Mapping
+- **Venue Mapping Mode**
+  - `sites`
+  - `locations`
+  - `both`
+- **Parent Site** (nur bei `locations`)
+- **Child Location Name** (nur bei `both`)
 
----
-
-## Disclaimer
-
-This project is **not officially supported** by CommScope or RUCKUS Networks.  
-Provided as-is for lab, PoC, and documentation purposes.
-
----
-
-## License
-
-MIT License
+#### Venue Selection
+- **Venues selected for Sync**
+  - leer = alle Venues
+  - Auswahl per Dual-List Selector
 
 ---
 
-## Author
+## 🧠 Wichtige Logik
 
-**Enrico Becker**  
-System Engineer
-GitHub: https://github.com/enrico-becker
+- **Keine Venue ausgewählt** → alle Venues werden synchronisiert
+- **Venues ausgewählt** → nur diese werden synchronisiert
+- Mapping & Selection gelten **pro Tenant**
+- Refresh Venues lädt Metadaten aus RUCKUS One, ohne Sync auszulösen
+
+---
+
+## 🔍 Debug / Checks
+
+### Venue Cache prüfen
+```bash
+docker compose exec netbox bash -lc "python manage.py shell -c \
+\"from ruckus_r1_sync.models import RuckusR1TenantConfig as C; c=C.objects.first(); print(len(c.venues_cache))\""
+```
+
+### Ausgewählte Venues prüfen
+```bash
+docker compose exec netbox bash -lc "python manage.py shell -c \
+\"from ruckus_r1_sync.models import RuckusR1TenantConfig as C; c=C.objects.first(); print(c.venues_selected)\""
+```
+
+---
+
+## 🚧 Roadmap (Ausblick)
+
+- Dry-Run Sync
+- Delta-Sync pro Venue
+- Sync-Log mit Venue-Filter
+- Bulk-Actions ("Sync only this Venue")
+- API-basierte Steuerung
+
+---
+
+## 👤 Autor
+
+Enrico Becker  
+System Engineer – RUCKUS Networks  
