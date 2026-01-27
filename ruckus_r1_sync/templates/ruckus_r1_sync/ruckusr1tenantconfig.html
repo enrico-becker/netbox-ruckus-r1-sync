@@ -14,17 +14,27 @@
 {% block content %}
 <div class="row">
   <div class="col col-md-10">
-    <<table class="table table-hover table-sm">
+    <table class="table table-hover table-sm">
       <tr><th class="w-25 text-nowrap">Tenant</th><td>{{ object.tenant }}</td></tr>
       <tr><th class="w-25 text-nowrap">Name</th><td>{{ object.name }}</td></tr>
       <tr><th class="w-25 text-nowrap">API Base URL</th><td>{{ object.api_base_url }}</td></tr>
       <tr><th class="w-25 text-nowrap">Tenant ID</th><td>{{ object.ruckus_tenant_id }}</td></tr>
       <tr><th class="w-25 text-nowrap">Enabled</th><td>{{ object.enabled }}</td></tr>
-      <tr><th class="w-25 text-nowrap"></th><td></td></tr>
+    </table>
+  </div>
+</div>
+<div class="row">
+  <div class="col col-md-10">
+    <table class="table table-hover table-sm">
       <tr><th class="w-25 text-nowrap">Last Sync</th><td>{{ object.last_sync }}</td></tr>
       <tr><th class="w-25 text-nowrap">Last Status</th><td>{{ object.last_sync_status }}</td></tr>
       <tr><th class="w-25 text-nowrap">Last Sync Message</th><td>{{ object.last_sync_message }}</td></tr>
-      <tr><th class="w-25 text-nowrap"></th><td></td></tr>
+    </table>
+  </div>
+</div>
+<div class="row">
+  <div class="col col-md-10">
+    <table class="table table-hover table-sm">
       <tr><th class="w-25 text-nowrap">Authoritative Devices</th><td>{{ object.authoritative_devices }}</td></tr>
       <tr><th class="w-25 text-nowrap">Authoritative Interfaces</th><td>{{ object.authoritative_interfaces }}</td></tr>
       <tr><th class="w-25 text-nowrap">Authoritative Vlans</th><td>{{ object.authoritative_vlans }}</td></tr>
