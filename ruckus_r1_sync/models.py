@@ -36,7 +36,15 @@ class RuckusR1TenantConfig(NetBoxModel):
     allow_stub_devices = models.BooleanField(default=True)
     allow_stub_vlans = models.BooleanField(default=True)
     allow_stub_wireless = models.BooleanField(default=True)
-
+    sync_wlans = models.BooleanField(default=True)
+    sync_aps = models.BooleanField(default=True)
+    sync_switches = models.BooleanField(default=True)
+    sync_interfaces = models.BooleanField(default=True)
+    sync_wifi_clients = models.BooleanField(default=True)
+    sync_wired_clients = models.BooleanField(default=True)
+    sync_cabling = models.BooleanField(default=True)
+    sync_wireless_links = models.BooleanField(default=True)
+    sync_vlans = models.BooleanField(default=False)  # wenn du VLAN später implementierst
     authoritative_devices = models.BooleanField(default=False)
     authoritative_interfaces = models.BooleanField(default=False)
     authoritative_ips = models.BooleanField(default=False)
@@ -63,7 +71,8 @@ class RuckusR1TenantConfig(NetBoxModel):
         return f"{self.name} (Tenant: {self.tenant})"
 
     def get_absolute_url(self):
-        return reverse("plugins:ruckus_r1_sync:tenantconfig", kwargs={"pk": self.pk})
+        # IMPORTANT: must match urls.py name
+        return reverse("plugins:ruckus_r1_sync:ruckusr1tenantconfig", kwargs={"pk": self.pk})
 
 
 class RuckusR1SyncLog(NetBoxModel):
@@ -114,7 +123,7 @@ class RuckusR1SyncLog(NetBoxModel):
         return f"{self.tenant} {self.status} ({self.created})"
 
     def get_absolute_url(self):
-        return reverse("plugins:ruckus_r1_sync:sync_logs")
+        return reverse("plugins:ruckus_r1_sync:ruckusr1synclog_list")
 
 
 class RuckusR1Client(NetBoxModel):
@@ -149,4 +158,6 @@ class RuckusR1Client(NetBoxModel):
 
     def __str__(self) -> str:
         return f"{self.mac} ({self.tenant})"
- 
+
+    def get_absolute_url(self):
+        return reverse("plugins:ruckus_r1_sync:ruckusr1client_list")

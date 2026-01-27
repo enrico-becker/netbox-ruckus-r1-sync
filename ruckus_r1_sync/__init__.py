@@ -13,7 +13,8 @@ class RuckusR1SyncConfig(PluginConfig):
     # IMPORTANT: relative to module ruckus_r1_sync (package)
     menu = "navigation.menu"
     api_urls = "api.urls"
-
+    css = ["ruckus_r1_sync/css/icons.css"]
+    template_extensions = "template_extensions.template_extensions"
 
 config = RuckusR1SyncConfig
  

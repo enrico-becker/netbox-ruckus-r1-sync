@@ -11,7 +11,7 @@ menu_items = (
             PluginMenuButton(
                 link="plugins:ruckus_r1_sync:ruckusr1tenantconfig_add",
                 title="Add",
-                icon_class="mdi mdi-plus-thick",
+                icon_class="icon-ruckus-dog",
             ),
         ),
     ),
@@ -20,6 +20,6 @@ menu_items = (
 menu = PluginMenu(
     label="RUCKUS One Sync",
     groups=(("RUCKUS One", menu_items),),
-    icon_class="mdi mdi-wifi",
+    icon_class="icon-ruckus-dog",
 )
  

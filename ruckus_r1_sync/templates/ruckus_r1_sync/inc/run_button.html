@@ -1,0 +1,16 @@
+{% load i18n %}
+<div class="btn-group btn-group-sm" role="group">
+  <a class="btn btn-outline-primary"
+     href="{% url 'plugins:ruckus_r1_sync:ruckusr1tenantconfig_edit' pk=record.pk %}">
+    {% trans "Edit" %}
+  </a>
+
+  <form method="post"
+        action="{% url 'plugins:ruckus_r1_sync:ruckusr1tenantconfig_run' pk=record.pk %}"
+        style="display:inline;">
+    {% csrf_token %}
+    <button type="submit" class="btn btn-success">
+      {% trans "Run" %}
+    </button>
+  </form>
+</div>

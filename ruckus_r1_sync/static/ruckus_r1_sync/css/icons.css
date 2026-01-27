@@ -1,0 +1,15 @@
+.icon-ruckus-dog {
+  display: inline-block !important;
+  width: 1.1em;
+  height: 1.1em;
+  vertical-align: -0.15em;
+
+  background-color: currentColor !important;
+
+  -webkit-mask: url("/static/ruckus_r1_sync/icons/ruckus-dog.svg") no-repeat center / contain;
+  mask: url("/static/ruckus_r1_sync/icons/ruckus-dog.svg") no-repeat center / contain;
+}
+
+.icon-ruckus-dog::before {
+  content: "" !important;
+}

@@ -1,0 +1,18 @@
+{% load i18n %}
+
+<div class="btn-group btn-group-sm" role="group" aria-label="{% trans 'Actions' %}">
+  <a class="btn btn-primary"
+     href="{% url 'plugins:ruckus_r1_sync:ruckusr1tenantconfig' pk=record.pk %}">
+    {% trans "View" %}
+  </a>
+
+  <a class="btn btn-warning"
+     href="{% url 'plugins:ruckus_r1_sync:ruckusr1tenantconfig_edit' pk=record.pk %}">
+    {% trans "Edit" %}
+  </a>
+
+  <a class="btn btn-danger"
+     href="{% url 'plugins:ruckus_r1_sync:ruckusr1tenantconfig_delete' pk=record.pk %}">
+    {% trans "Delete" %}
+  </a>
+</div>
