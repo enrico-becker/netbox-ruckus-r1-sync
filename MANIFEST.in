@@ -1,0 +1,5 @@
+recursive-include ruckus_r1_sync/static *
+recursive-include ruckus_r1_sync/templates *
+recursive-include ruckus_r1_sync/api *
+recursive-include ruckus_r1_sync/management *
+prune ruckus_r1_sync/__pycache__
