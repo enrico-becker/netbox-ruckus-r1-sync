@@ -1,4 +1,10 @@
-from setuptools import setup, find_packages
+from pathlib import Path
+
+from setuptools import find_packages, setup
+
+readme = Path(__file__).parent / "README.md"
+
+long_description = readme.read_text()
 
 setup(
     name="netbox-ruckus-r1-sync",
