@@ -793,12 +793,62 @@ def _cable_exists_between(a_iface, b_iface) -> bool:
     return bool(a_ids.intersection(b_ids))
 
 
-def _create_cable(a_iface, b_iface, status: str = "connected") -> bool:
+def _delete_cables_for_termination(iface) -> int:
+    """Delete any existing cables attached to this termination (best effort).
+
+    In NetBox, a termination (e.g. an Interface) can only belong to one Cable end.
+    When running in authoritative mode we remove existing cabling before re-creating it.
+    """
+    try:
+        Cable = _nb_model("dcim", "Cable")
+        CableTermination = _nb_model("dcim", "CableTermination")
+    except Exception:
+        return 0
+
+    try:
+        ct_iface = ContentType.objects.get_for_model(iface.__class__)
+        cable_ids = list(
+            CableTermination.objects.filter(termination_type=ct_iface, termination_id=iface.id)
+            .values_list("cable_id", flat=True)
+        )
+        if cable_ids:
+            Cable.objects.filter(id__in=cable_ids).delete()
+        return len(cable_ids)
+    except Exception:
+        return 0
+
+
+def _termination_has_cable(iface) -> bool:
+    try:
+        CableTermination = _nb_model("dcim", "CableTermination")
+        ct_iface = ContentType.objects.get_for_model(iface.__class__)
+        return CableTermination.objects.filter(termination_type=ct_iface, termination_id=iface.id).exists()
+    except Exception:
+        return False
+
+
+def _create_cable(a_iface, b_iface, status: str = "connected", *, authoritative: bool = False) -> bool:
+    """Create a cable between two interfaces.
+
+    - If the cable already exists, do nothing.
+    - If either termination already has a cable:
+        - authoritative=False: skip (do not overwrite manual cabling)
+        - authoritative=True: delete existing cables on those terminations and re-create
+    """
     Cable = _nb_model("dcim", "Cable")
     ct_iface = ContentType.objects.get_for_model(a_iface.__class__)
 
     if _cable_exists_between(a_iface, b_iface):
         return False
+
+    # NetBox enforces a unique cable termination per interface (newer schema).
+    # If we're not authoritative, never overwrite existing cabling.
+    if not _cable_supports_legacy_fields(Cable):
+        if (_termination_has_cable(a_iface) or _termination_has_cable(b_iface)) and not authoritative:
+            return False
+        if authoritative:
+            _delete_cables_for_termination(a_iface)
+            _delete_cables_for_termination(b_iface)
 
     if _cable_supports_legacy_fields(Cable):
         kwargs = dict(
@@ -878,67 +928,6 @@ def _create_wireless_link_best_effort(
         return True
     except Exception:
         return False
-
-def _create_wifi_client_link_best_effort(
-    cfg: RuckusR1TenantConfig,
-    ap_device: Device,
-    client_device: Device,
-    *,
-    client_mac: str,
-    ap_bssid: str = "",
-    ssid: str = "",
-    auth: str = "",
-    status: str = "active",
-    description: str = "",
-) -> bool:
-    """Create a NetBox WirelessLink for a Wi-Fi client association (AP <-> client).
-
-    NetBox's WirelessLink model is fairly generic; we store SSID if the field exists and
-    put auth/encryption etc. into the description (best effort).
-    """
-    try:
-        WirelessLink = _nb_model("wireless", "WirelessLink")
-    except Exception:
-        return False
-
-    # Use stable interface names so we can deduplicate and not create a new link every run.
-    ap_iface = _ensure_interface(ap_device, "wlan-clients")
-    client_iface = _ensure_interface(client_device, "wlan0")
-
-    # Attach MACs (best effort)
-    if ap_bssid:
-        _upsert_macaddress_best_effort(ap_iface, ap_bssid)
-    if client_mac:
-        _upsert_macaddress_best_effort(client_iface, client_mac)
-
-    qs = WirelessLink.objects.all()
-    if qs.filter(interface_a=ap_iface, interface_b=client_iface).exists():
-        return False
-    if qs.filter(interface_a=client_iface, interface_b=ap_iface).exists():
-        return False
-
-    obj = WirelessLink(
-        interface_a=ap_iface,
-        interface_b=client_iface,
-        tenant=cfg.tenant if hasattr(WirelessLink, "tenant") else None,
-    )
-
-    if hasattr(obj, "ssid") and ssid:
-        obj.ssid = ssid[:64]
-    if hasattr(obj, "status") and status:
-        obj.status = status
-    if hasattr(obj, "description"):
-        desc = description or ""
-        if auth:
-            desc = (f"{desc} | auth={auth}" if desc else f"auth={auth}")
-        obj.description = desc[:200]
-
-    try:
-        obj.save()
-        return True
-    except Exception:
-        return False
-
 
 
 # -----------------
@@ -1052,77 +1041,6 @@ def _sync_switch_ports_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client,
     return (touched_ifaces, touched_macs, touched_vlans)
 
 
-def _create_interface_connection_best_effort(a_iface, b_iface) -> bool:
-    """Create a /dcim/interface-connections/ entry if the model exists in this NetBox version.
-
-    NetBox changed internals across versions; we introspect fields to stay compatible.
-    """
-    try:
-        InterfaceConnection = apps.get_model("dcim", "InterfaceConnection")
-    except Exception:
-        return False
-    if InterfaceConnection is None:
-        return False
-
-    try:
-        field_names = {f.name for f in InterfaceConnection._meta.fields}
-    except Exception:
-        field_names = set()
-
-    def _set_status(obj) -> None:
-        if "status" in field_names and getattr(obj, "status", None) != "connected":
-            obj.status = "connected"
-        if "connection_status" in field_names and getattr(obj, "connection_status", None) != "connected":
-            obj.connection_status = "connected"
-
-    try:
-        obj = None
-        if {"interface_a", "interface_b"}.issubset(field_names):
-            obj = (
-                InterfaceConnection.objects.filter(interface_a=a_iface, interface_b=b_iface).first()
-                or InterfaceConnection.objects.filter(interface_a=b_iface, interface_b=a_iface).first()
-            )
-            if obj is None:
-                obj = InterfaceConnection(interface_a=a_iface, interface_b=b_iface)
-            _set_status(obj)
-            obj.save()
-            return True
-
-        if {"interface", "connected_interface"}.issubset(field_names):
-            obj = (
-                InterfaceConnection.objects.filter(interface=a_iface, connected_interface=b_iface).first()
-                or InterfaceConnection.objects.filter(interface=b_iface, connected_interface=a_iface).first()
-            )
-            if obj is None:
-                obj = InterfaceConnection(interface=a_iface, connected_interface=b_iface)
-            _set_status(obj)
-            obj.save()
-            return True
-
-    except Exception:
-        return False
-
-    return False
-
-
-def _query_switch_port_by_port_id(api: RuckusR1Client, *, venue_id: str, port_id: str) -> Optional[Dict[str, Any]]:
-    if not port_id:
-        return None
-    body = {
-        "page": 0,
-        "pageSize": 1,
-        "matchFields": [
-            {"field": "portId", "value": port_id},
-            {"field": "venueId", "value": venue_id},
-        ],
-    }
-    rows = _query_all(api, "/venues/switches/switchPorts/query", body)
-    if rows:
-        r0 = rows[0]
-        return r0 if isinstance(r0, dict) else None
-    return None
-
-
 def _sync_switch_clients_for_venue(
     cfg: RuckusR1TenantConfig,
     api: RuckusR1Client,
@@ -1130,80 +1048,23 @@ def _sync_switch_clients_for_venue(
     location,
     venue_id: str
 ) -> Tuple[int, int, int]:
-    """Sync wired switch clients -> create interface connections and (for Ethernet/copper ports) cables."""
     processed_clients = 0
     touched_ifaces = 0
     touched_cables = 0
 
-    # Endpoint expects matchFields style; we still use query_all() to paginate safely.
-    body = {
-        "page": 0,
-        "pageSize": 100,
-        "matchFields": [
-            {"field": "venueId", "value": venue_id},
-        ],
-    }
-    rows = _query_all(api, "/venues/switches/clients/query", body)
+    rows = _query_all(api, "/venues/switches/clients/query", {"venueId": venue_id, "limit": 5000})
     if not rows:
         return (0, 0, 0)
 
-    # Dedupe: per MAC only one client in NetBox.
-    # If the same (clientName + switchPort) appears multiple times, prefer entry with dhcpClientHostName.
-    by_mac: Dict[str, Dict[str, Any]] = {}
-    seen_key_has_dupes: set[Tuple[str, str]] = set()
     for cl in rows:
         if not isinstance(cl, dict):
             continue
-        mac = _norm_mac(cl.get("clientMac") or cl.get("macAddress") or cl.get("mac") or "")
-        if not _looks_like_mac(mac):
-            continue
 
-        client_name = (cl.get("clientName") or "").strip()
-        sw_port = (cl.get("switchPort") or cl.get("switchPortId") or "").strip()
-        key = (client_name, sw_port)
-        if key in seen_key_has_dupes:
-            pass
-        else:
-            # mark as duplicate candidate if already exists somewhere else later
-            for prev in by_mac.values():
-                if (prev.get("clientName") or "").strip() == client_name and (prev.get("switchPort") or prev.get("switchPortId") or "").strip() == sw_port:
-                    seen_key_has_dupes.add(key)
-                    break
+        mac = _norm_mac(cl.get("macAddress") or cl.get("mac") or cl.get("clientMac") or cl.get("deviceMac") or "")
+        ip = (cl.get("ipAddress") or cl.get("ip") or "").strip()
+        hostname = (cl.get("hostname") or cl.get("name") or "").strip()
 
-        existing = by_mac.get(mac)
-        if existing is None:
-            by_mac[mac] = cl
-            continue
-
-        # prefer row that has DHCP hostname if existing doesn't
-        dhcp_new = (cl.get("dhcpClientHostName") or "").strip()
-        dhcp_old = (existing.get("dhcpClientHostName") or "").strip()
-        if dhcp_new and not dhcp_old:
-            by_mac[mac] = cl
-
-    for mac, cl in by_mac.items():
-        if not isinstance(cl, dict):
-            continue
-
-        client_ip = (cl.get("clientIpv4Addr") or cl.get("clientIpv6Addr") or "").strip()
-        client_name = (cl.get("clientName") or "").strip()
-        dhcp_host = (cl.get("dhcpClientHostName") or "").strip()
-
-        switch_serial = (cl.get("switchSerialNumber") or "").strip()
-        switch_name = (cl.get("switchName") or "").strip()
-        switch_port = (cl.get("switchPort") or "").strip()
-        switch_port_id = (cl.get("switchPortId") or "").strip()
-
-        # Port details via /venues/switches/switchPorts/query portId
-        port_info = _query_switch_port_by_port_id(api, venue_id=venue_id, port_id=switch_port_id) if switch_port_id else None
-
-        if port_info and not switch_serial:
-            switch_serial = (port_info.get("switchUnitId") or "").strip() or switch_serial
-        if port_info and not switch_port:
-            switch_port = (port_info.get("portIdentifier") or "").strip() or switch_port
-
-        # Ensure Client object table (internal tracking)
-        vlan_raw = cl.get("clientVlan") or None
+        vlan_raw = cl.get("vlan") or cl.get("vlanId") or cl.get("accessVlan") or None
         vlan_int: Optional[int] = None
         try:
             if vlan_raw is not None and str(vlan_raw).strip() != "":
@@ -1211,15 +1072,30 @@ def _sync_switch_clients_for_venue(
         except Exception:
             vlan_int = None
 
+        switch_unit_id = (cl.get("switchUnitId") or cl.get("switchSerialNumber") or cl.get("switchSerial") or "").strip()
+        port_name = (cl.get("portIdentifier") or cl.get("port") or cl.get("connectedPort") or "").strip()
+
+        vinfo = cl.get("venueInformation") or {}
+        venue_id_effective = (vinfo.get("id") or venue_id or "").strip()
+
+        if not _looks_like_mac(mac):
+            for _, v in cl.items():
+                if isinstance(v, str) and _looks_like_mac(v):
+                    mac = _norm_mac(v)
+                    break
+
+        if not _looks_like_mac(mac):
+            mac = "unknown"
+
         RuckusR1ClientModel.objects.update_or_create(
             tenant=cfg.tenant,
             mac=mac,
             defaults={
-                "venue_id": venue_id,
-                "network_id": "",
-                "ruckus_id": (cl.get("id") or "")[:128],
-                "ip_address": client_ip or "",
-                "hostname": dhcp_host or client_name or "",
+                "venue_id": venue_id_effective,
+                "network_id": _safe_str(cl.get("networkId") or "", 128),
+                "ruckus_id": (switch_unit_id or "")[:128],
+                "ip_address": ip or "",
+                "hostname": hostname or "",
                 "vlan": vlan_int,
                 "ssid": "",  # wired
                 "last_seen": None,
@@ -1228,104 +1104,26 @@ def _sync_switch_clients_for_venue(
             },
         )
 
-        # Create/Update client as NetBox Device (ONE per MAC)
-        display_name = dhcp_host or client_name or f"client-{mac.replace(':','')[-6:]}"
-        client_dev, _ = _upsert_wired_client_as_dcim_device(cfg, site, location, cl, iface_name="eth0")
-        if not client_dev:
-            continue
-        client_iface = _ensure_interface(client_dev, "eth0")
-        touched_ifaces += 1
-        _upsert_macaddress_best_effort(client_iface, mac)
+        client_dev = None
+        client_iface = None
+        if mac != "unknown":
+            client_dev, _ = _upsert_wired_client_as_dcim_device(cfg, site, location, cl, iface_name="eth0")
+            if client_dev:
+                client_iface = _ensure_interface(client_dev, "eth0")
+                touched_ifaces += 1
 
-        # Find/ensure switch
-        sw = None
-        if switch_serial:
-            sw = Device.objects.filter(tenant=cfg.tenant, site=site, serial=switch_serial).first()
-        if sw is None and switch_name:
-            sw = Device.objects.filter(tenant=cfg.tenant, site=site, name=switch_name).first()
-
-        if sw is None:
-            # best-effort create a switch placeholder if it wasn't synced yet
-            sw = _get_or_create_device_infra(cfg, site, location, "Switch", "Switch", switch_name or switch_serial or "Switch", serial=switch_serial)
-
-        # Ensure switch interface (name = portIdentifier)
-        port_identifier = (port_info.get("portIdentifier") if isinstance(port_info, dict) else "") or switch_port or "unknown"
-        sw_iface = _ensure_interface(sw, port_identifier)
-        touched_ifaces += 1
-
-        # Label, speed, mac, poe, description on switch iface
-        if isinstance(port_info, dict):
-            if hasattr(sw_iface, "label"):
-                label = (port_info.get("name") or "").strip()
-                if label and (getattr(sw_iface, "label", "") or "") != label:
-                    sw_iface.label = label[:100]
-                    sw_iface.save()
-
-            speed_kbps = _parse_link_speed_to_kbps(str(port_info.get("portSpeed") or ""))
-            poe_type = (port_info.get("poeType") or "").strip()
-            admin_up = (str(port_info.get("adminStatus") or "").lower() == "up")
-            desc_parts = []
-            if port_info.get("status"):
-                desc_parts.append(f"link={port_info['status']}")
-            if port_info.get("portConnectorType"):
-                desc_parts.append(f"connector={port_info['portConnectorType']}")
-            if port_info.get("opticsType"):
-                desc_parts.append(f"media={port_info['opticsType']}")
-            if port_info.get("vlanIds"):
-                desc_parts.append(f"vlans={port_info['vlanIds']}")
-            if port_info.get("unTaggedVlan"):
-                desc_parts.append(f"untag={port_info['unTaggedVlan']}")
-            if poe_type:
-                desc_parts.append(f"poe={poe_type}")
-            if port_info.get("neighborName"):
-                desc_parts.append(f"neighbor={port_info['neighborName']}")
-
-            _set_interface_fields_best_effort(
-                sw_iface,
-                enabled=admin_up,
-                speed_kbps=speed_kbps,
-                poe_enabled=bool(port_info.get("poeEnabled")) if port_info.get("poeEnabled") is not None else None,
-                description=" | ".join(desc_parts).strip(),
-            )
-
-            if port_info.get("portMac"):
-                _upsert_macaddress_best_effort(sw_iface, port_info.get("portMac"))
-
-        # InterfaceConnection (always, best-effort)
-        _create_interface_connection_best_effort(sw_iface, client_iface)
-
-        # Cable only for Ethernet/copper-style interfaces
-        is_eth = False
-        if isinstance(port_info, dict):
-            name_l = str(port_info.get("name") or "").lower()
-            optics_l = str(port_info.get("opticsType") or "").lower()
-            connector = str(port_info.get("portConnectorType") or "").upper()
-            is_eth = ("ethernet" in name_l) or ("copper" in optics_l) or (connector == "COPPER")
-        else:
-            is_eth = True  # fallback: assume it's copper if we can't tell
-
-        # Cable create (idempotent)
-        if is_eth:
-            if _create_cable(sw_iface, client_iface, status="connected"):
-                touched_cables += 1
-
-        # Duplicate clientName+switchPort handling: description hint
-        key = (client_name, (cl.get("switchPort") or cl.get("switchPortId") or "").strip())
-        if hasattr(client_iface, "description"):
-            if dhcp_host and key in seen_key_has_dupes:
-                hint = f"{dhcp_host} via {client_name}".strip(" via ")
-                if hint and hint not in (client_iface.description or ""):
-                    client_iface.description = hint[:200]
-                    client_iface.save()
-            elif not dhcp_host:
-                # Explicit rule: if no dhcpClientHostName, use clientName
-                if client_name and (client_iface.description or "") != client_name[:200]:
-                    client_iface.description = client_name[:200]
-                    client_iface.save()
+        if client_dev and client_iface and switch_unit_id and port_name:
+            sw = Device.objects.filter(tenant=cfg.tenant, site=site, serial=switch_unit_id).first()
+            if sw:
+                sw_iface = _ensure_interface(sw, port_name)
+                touched_ifaces += 1
+                if _create_cable(sw_iface, client_iface, status="connected", authoritative=bool(getattr(cfg, 'authoritative_cabling', False))):
+                    touched_cables += 1
 
         processed_clients += 1
 
     return (processed_clients, touched_ifaces, touched_cables)
+
 
 # -----------------
 # Topology sync (wired + wireless links)
@@ -1430,7 +1228,7 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
                 description=f"R1 topology: {status}".strip(),
             )
 
-            if _create_cable(a_iface, b_iface, status="connected"):
+            if _create_cable(a_iface, b_iface, status="connected", authoritative=bool(getattr(cfg, 'authoritative_cabling', False))):
                 touched_cables += 1
 
         else:
@@ -1633,42 +1431,8 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
                             },
                         )
 
-                        client_dev = None
                         if mac != "unknown":
-                            client_dev, _ = _upsert_client_as_dcim_device(cfg, site, location, cl)
-
-                        # Optional: create WirelessLink AP <-> client (SSID association)
-                        if do_wireless_links and client_dev and ap_serial:
-                            ap_dev = Device.objects.filter(tenant=cfg.tenant, site=site, serial=ap_serial).first()
-                            if ap_dev:
-                                # Build auth string from networkInformation
-                                enc = (netinfo.get("encryptionMethod") or "").strip()
-                                ntype = (netinfo.get("type") or "").strip().lower()
-                                auth_str = ""
-                                if enc and ntype:
-                                    auth_str = f"{enc} {('PSK' if ntype == 'psk' else ntype.upper())}"
-                                elif enc:
-                                    auth_str = enc
-                                elif ntype:
-                                    auth_str = ntype.upper()
-
-                                bssid = (apinfo.get("bssid") or apinfo.get("macAddress") or "").strip()
-                                # short descriptive text
-                                model_name = (cl.get("modelName") or cl.get("deviceType") or "client").strip()
-                                host_hint = (hostname or model_name or "client").strip()
-                                desc = f"{host_hint} ({mac}) on SSID {ssid} via AP {ap_dev.name} ({ap_serial})"
-                                if _create_wifi_client_link_best_effort(
-                                    cfg,
-                                    ap_dev,
-                                    client_dev,
-                                    client_mac=mac,
-                                    ap_bssid=bssid,
-                                    ssid=ssid,
-                                    auth=auth_str,
-                                    status="active",
-                                    description=desc,
-                                ):
-                                    processed_wlinks += 1
+                            _upsert_client_as_dcim_device(cfg, site, location, cl)
 
                         processed_clients += 1
 
