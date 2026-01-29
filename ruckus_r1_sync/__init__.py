@@ -15,6 +15,8 @@ class RuckusR1SyncConfig(PluginConfig):
     api_urls = "api.urls"
     css = ["ruckus_r1_sync/css/icons.css"]
     template_extensions = "template_extensions.template_extensions"
+    def ready(self):
+        super().ready()
+        from . import jobs
 
 config = RuckusR1SyncConfig
- 
