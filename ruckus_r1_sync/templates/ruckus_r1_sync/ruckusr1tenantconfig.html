@@ -3,11 +3,9 @@
 
 {% block extra_controls %}
   {{ block.super }}
-  <form method="post" action="{% url 'plugins:ruckus_r1_sync:ruckusr1tenantconfig_run' pk=object.pk %}" style="display:inline;">
+  <form method="post" action="{% url 'plugins:ruckus_r1_sync:ruckusr1tenantconfig_run' pk=object.pk %}" class="d-inline">
     {% csrf_token %}
-    <button type="submit" class="btn btn-primary">
-      Run Sync
-    </button>
+    <button type="submit" class="btn btn-primary">Run Sync</button>
   </form>
   <form method="post"
         action="{% url 'plugins:ruckus_r1_sync:ruckusr1tenantconfig_refresh_venues' pk=object.pk %}"
@@ -18,36 +16,86 @@
 {% endblock extra_controls %}
 
 {% block content %}
+
 <div class="row">
   <div class="col col-md-10">
+
+    <h5>General</h5>
     <table class="table table-hover table-sm">
-      <tr><th class="w-25 text-nowrap">Tenant</th><td>{{ object.tenant }}</td></tr>
-      <tr><th class="w-25 text-nowrap">Name</th><td>{{ object.name }}</td></tr>
-      <tr><th class="w-25 text-nowrap">API Base URL</th><td>{{ object.api_base_url }}</td></tr>
-      <tr><th class="w-25 text-nowrap">Tenant ID</th><td>{{ object.ruckus_tenant_id }}</td></tr>
-      <tr><th class="w-25 text-nowrap">Enabled</th><td>{{ object.enabled }}</td></tr>
+      <tr><th class="w-25">Tenant</th><td>{{ object.tenant }}</td></tr>
+      <tr><th>Name</th><td>{{ object.name }}</td></tr>
+      <tr><th>Enabled</th><td>{{ object.enabled }}</td></tr>
+      <tr><th>API Base URL</th><td>{{ object.api_base_url }}</td></tr>
+      <tr><th>RUCKUS Tenant ID</th><td>{{ object.ruckus_tenant_id }}</td></tr>
     </table>
+
+    <h5>Defaults</h5>
+    <table class="table table-hover table-sm">
+      <tr><th class="w-25">Default Site Group</th><td>{{ object.default_site_group }}</td></tr>
+      <tr><th>Default Device Role</th><td>{{ object.default_device_role }}</td></tr>
+      <tr><th>Default Manufacturer</th><td>{{ object.default_manufacturer }}</td></tr>
+    </table>
+
+    <h5>Venue Mapping</h5>
+    <table class="table table-hover table-sm">
+      <tr><th class="w-25">Mapping Mode</th><td>{{ object.venue_mapping_mode }}</td></tr>
+      <tr><th>Parent Site</th><td>{{ object.venue_locations_parent_site }}</td></tr>
+      <tr><th>Child Location Name</th><td>{{ object.venue_child_location_name }}</td></tr>
+    </table>
+
+    <h5>Venue Selection</h5>
+    <table class="table table-hover table-sm">
+      <tr>
+        <th class="w-25">Venues to Sync</th>
+        <td>
+          {% if object.venues_selected %}
+            <ul class="mb-0">
+            {% for vid in object.venues_selected %}
+              {% for v in object.venues_cache %}
+                {% if v.id == vid %}
+                  <li>{{ v.name }} ({{ v.id }})</li>
+                {% endif %}
+              {% endfor %}
+            {% endfor %}
+            </ul>
+          {% else %}
+            <em>All venues</em>
+          {% endif %}
+        </td>
+      </tr>
+    </table>
+
+    <h5>Sync Options</h5>
+    <table class="table table-hover table-sm">
+      <tr><th class="w-25">Sync WLANs</th><td>{{ object.sync_wlans }}</td></tr>
+      <tr><th>Sync APs</th><td>{{ object.sync_aps }}</td></tr>
+      <tr><th>Sync Switches</th><td>{{ object.sync_switches }}</td></tr>
+      <tr><th>Sync Interfaces</th><td>{{ object.sync_interfaces }}</td></tr>
+      <tr><th>Sync VLANs</th><td>{{ object.sync_vlans }}</td></tr>
+      <tr><th>Sync WiFi Clients</th><td>{{ object.sync_wifi_clients }}</td></tr>
+      <tr><th>Sync Wired Clients</th><td>{{ object.sync_wired_clients }}</td></tr>
+      <tr><th>Sync Cabling</th><td>{{ object.sync_cabling }}</td></tr>
+      <tr><th>Sync Wireless Links</th><td>{{ object.sync_wireless_links }}</td></tr>
+    </table>
+
+    <h5>Authoritative Mode</h5>
+    <table class="table table-hover table-sm">
+      <tr><th class="w-25">Devices</th><td>{{ object.authoritative_devices }}</td></tr>
+      <tr><th>Interfaces</th><td>{{ object.authoritative_interfaces }}</td></tr>
+      <tr><th>IPs</th><td>{{ object.authoritative_ips }}</td></tr>
+      <tr><th>VLANs</th><td>{{ object.authoritative_vlans }}</td></tr>
+      <tr><th>Wireless</th><td>{{ object.authoritative_wireless }}</td></tr>
+      <tr><th>Cabling</th><td>{{ object.authoritative_cabling }}</td></tr>
+    </table>
+
+    <h5>Status</h5>
+    <table class="table table-hover table-sm">
+      <tr><th class="w-25">Last Sync</th><td>{{ object.last_sync }}</td></tr>
+      <tr><th>Last Status</th><td>{{ object.last_sync_status }}</td></tr>
+      <tr><th>Last Message</th><td>{{ object.last_sync_message }}</td></tr>
+    </table>
+
   </div>
 </div>
-<div class="row">
-  <div class="col col-md-10">
-    <table class="table table-hover table-sm">
-      <tr><th class="w-25 text-nowrap">Last Sync</th><td>{{ object.last_sync }}</td></tr>
-      <tr><th class="w-25 text-nowrap">Last Status</th><td>{{ object.last_sync_status }}</td></tr>
-      <tr><th class="w-25 text-nowrap">Last Sync Message</th><td>{{ object.last_sync_message }}</td></tr>
-    </table>
-  </div>
-</div>
-<div class="row">
-  <div class="col col-md-10">
-    <table class="table table-hover table-sm">
-      <tr><th class="w-25 text-nowrap">Authoritative Devices</th><td>{{ object.authoritative_devices }}</td></tr>
-      <tr><th class="w-25 text-nowrap">Authoritative Interfaces</th><td>{{ object.authoritative_interfaces }}</td></tr>
-      <tr><th class="w-25 text-nowrap">Authoritative Vlans</th><td>{{ object.authoritative_vlans }}</td></tr>
-      <tr><th class="w-25 text-nowrap">Authoritative Wireless</th><td>{{ object.authoritative_wireless }}</td></tr>
-      <tr><th class="w-25 text-nowrap">Authoritative Cabling</th><td>{{ object.authoritative_cabling }}</td></tr>
-      
-    </table>
-  </div>
-</div>
+
 {% endblock %}

@@ -1,74 +1,92 @@
 from __future__ import annotations
 
-from typing import List, Tuple
-
+import importlib
 from django import forms
-from django.utils.translation import gettext_lazy as _
-
-from dcim.models import Site
 from netbox.forms import NetBoxModelForm
 
 from .models import RuckusR1TenantConfig
 
 
-API_BASE_URL_CHOICES = (
-    ("https://api.asia.ruckus.cloud", _("Asia – https://api.asia.ruckus.cloud")),
-    ("https://api.eu.ruckus.cloud", _("Europe – https://api.eu.ruckus.cloud")),
-    ("https://api.ruckus.cloud", _("North America – https://api.ruckus.cloud")),
-)
+def _resolve_dual_widget():
+    """Return the NetBox dual-list widget class if available, else SelectMultiple.
+
+    NetBox has changed widget locations/names across versions. We try a few known paths.
+    """
+    candidates = [
+        # NetBox 4.x (varies by minor)
+        ("utilities.forms.widgets.dual_listbox", "DualListbox"),
+        ("utilities.forms.widgets.dual_select", "DualSelect"),
+        ("utilities.forms.widgets", "DualListbox"),
+        ("utilities.forms.widgets", "DualSelect"),
+        # Older community forks
+        ("utilities.forms.widgets", "DualListSelector"),
+    ]
+    for mod_name, cls_name in candidates:
+        try:
+            mod = importlib.import_module(mod_name)
+            cls = getattr(mod, cls_name, None)
+            if cls:
+                return cls
+        except Exception:
+            continue
+    return forms.SelectMultiple
 
 
-class DualListSelectorWidget(forms.SelectMultiple):
-    """
-    Two-list selector widget template (left=available, right=selected).
-    Must inherit SelectMultiple so Django provides optgroups/choices in template context.
-    """
-    template_name = "ruckus_r1_sync/widgets/dual_list_selector.html"
+_DualWidget = _resolve_dual_widget()
 
 
 class RuckusR1TenantConfigForm(NetBoxModelForm):
-    api_base_url = forms.ChoiceField(
-        label=_("API base URL / Region"),
-        choices=API_BASE_URL_CHOICES,
-        required=True,
-    )
+    """Tenant config form with dual-list selector for venue selection.
 
-    venue_locations_parent_site = forms.ModelChoiceField(
-        label=_("Parent Site (required for 'locations' mode)"),
-        queryset=Site.objects.all().order_by("name"),
-        required=False,
-    )
+    The model stores venue IDs in JSON field `venues_selected` (list[str]).
+    The widget renders as two lists (available / selected) with move buttons when supported
+    by the NetBox version. If not supported, it degrades to a normal multi-select.
+    """
 
     venues_selected = forms.MultipleChoiceField(
-        label=_("Venues selected for Sync"),
         required=False,
-        widget=DualListSelectorWidget(),
-        help_text=_("Move Venues to the right to sync only those. Leave empty to sync ALL Venues."),
+        choices=(),
+        widget=_DualWidget(),
+        label="Venues to sync",
+        help_text="If empty: sync ALL venues. Use the arrows to move venues between lists (if available).",
     )
 
     class Meta:
         model = RuckusR1TenantConfig
-        fields = (
+        fields = [
+            # General
             "tenant",
             "name",
+            "enabled",
+
+            # API
             "api_base_url",
             "ruckus_tenant_id",
             "client_id",
             "client_secret",
-            "enabled",
 
-            # --- Mapping Roadmap ---
-            "venue_mapping_mode",
-            "venue_child_location_name",
-            "venue_locations_parent_site",
+            # Defaults
+            "default_site_group",
+            "default_device_role",
+            "default_manufacturer",
 
-            # --- Venue Roadmap ---
-            "venues_selected",
-
-            # authoritativeness + stubs
+            # Stubs
             "allow_stub_devices",
             "allow_stub_vlans",
             "allow_stub_wireless",
+
+            # Sync toggles
+            "sync_wlans",
+            "sync_aps",
+            "sync_switches",
+            "sync_interfaces",
+            "sync_wifi_clients",
+            "sync_wired_clients",
+            "sync_cabling",
+            "sync_wireless_links",
+            "sync_vlans",
+
+            # Authoritative toggles
             "authoritative_devices",
             "authoritative_interfaces",
             "authoritative_ips",
@@ -76,64 +94,47 @@ class RuckusR1TenantConfigForm(NetBoxModelForm):
             "authoritative_wireless",
             "authoritative_cabling",
 
-            "default_site_group",
-            "default_device_role",
-            "default_manufacturer",
-        )
+            # Venue mapping
+            "venue_mapping_mode",
+            "venue_child_location_name",
+            "venue_locations_parent_site",
 
-    def _venue_choices_from_cache(self) -> List[Tuple[str, str]]:
-        cache = getattr(self.instance, "venues_cache", None) or []
-        out: List[Tuple[str, str]] = []
-        for row in cache:
-            if not isinstance(row, dict):
-                continue
-            vid = (row.get("id") or "").strip()
-            name = (row.get("name") or vid or "").strip()
-            if not vid:
-                continue
-            out.append((vid, name))
-        out.sort(key=lambda x: (x[1] or "", x[0] or ""))
-        return out
+            # Venue selection
+            "venues_selected",
+        ]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        cur = getattr(self.instance, "api_base_url", None)
-        if cur and cur not in dict(API_BASE_URL_CHOICES):
-            self.fields["api_base_url"].choices = ((cur, cur),) + API_BASE_URL_CHOICES
+        inst = getattr(self, "instance", None)
+        cache = list(getattr(inst, "venues_cache", []) or []) if inst and inst.pk else []
+        selected = list(getattr(inst, "venues_selected", []) or []) if inst and inst.pk else []
 
-        self.fields["venue_child_location_name"].help_text = _(
-            "Used only when mapping mode is 'both' (Location name created under the Venue Site)."
-        )
+        choices = []
+        for v in cache:
+            if not isinstance(v, dict):
+                continue
+            vid = (v.get("id") or "").strip()
+            vname = (v.get("name") or vid).strip()
+            if not vid:
+                continue
+            label = f"{vname} ({vid})" if vname and vname != vid else vid
+            choices.append((vid, label))
 
-        # Choices from cached venues (Refresh Venues fills this)
-        self.fields["venues_selected"].choices = self._venue_choices_from_cache()
+        choices.sort(key=lambda x: (x[1].lower(), x[0]))
+        self.fields["venues_selected"].choices = choices
 
-        selected = getattr(self.instance, "venues_selected", None) or []
-        if isinstance(selected, list):
-            self.initial["venues_selected"] = [str(x) for x in selected]
+        sel = set(selected)
+        self.initial["venues_selected"] = [vid for vid, _ in choices if vid in sel]
 
-    def clean(self):
-        cleaned = super().clean()
-        if cleaned is None:
-            cleaned = self.cleaned_data
+    def clean_venues_selected(self):
+        value = self.cleaned_data.get("venues_selected") or []
+        return list(value)
 
-        mode = (cleaned.get("venue_mapping_mode") or "").strip().lower()
-        parent_site = cleaned.get("venue_locations_parent_site")
-        child_name = (cleaned.get("venue_child_location_name") or "").strip()
-
-        if mode == RuckusR1TenantConfig.VENUE_MAPPING_LOCATIONS and not parent_site:
-            self.add_error(
-                "venue_locations_parent_site",
-                _("This field is required when mapping mode is 'locations'."),
-            )
-
-        if mode == RuckusR1TenantConfig.VENUE_MAPPING_BOTH:
-            cleaned["venue_child_location_name"] = child_name or "Venue"
-
-        sel = cleaned.get("venues_selected") or []
-        if not isinstance(sel, list):
-            sel = list(sel)
-        cleaned["venues_selected"] = [str(x).strip() for x in sel if str(x).strip()]
-
-        return cleaned
+    def save(self, commit=True):
+        obj = super().save(commit=False)
+        obj.venues_selected = self.cleaned_data.get("venues_selected") or []
+        if commit:
+            obj.save()
+            self.save_m2m()
+        return obj

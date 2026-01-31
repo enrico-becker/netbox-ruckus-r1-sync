@@ -21,36 +21,15 @@ class RuckusR1TenantConfigView(generic.ObjectView):
     queryset = RuckusR1TenantConfig.objects.all()
     template_name = "ruckus_r1_sync/ruckusr1tenantconfig.html"
     object_fields = (
-        ("General", (
-            "tenant",
-            "name",
-            "enabled",
-        )),
-        ("Ruckus API", (
-            "api_base_url",
-            "ruckus_tenant_id",
-            "client_id",
-        )),
-        ("Venue Mapping", (
-            "venue_mapping_mode",
-            "venue_child_location_name",
-            "venue_locations_parent_site",
-        )),
-        ("Venue Selection", (
-            "venues_selected",
-        )),
-        ("Sync Options", (
-            "authoritative_devices",
-            "authoritative_interfaces",
-            "authoritative_vlans",
-            "authoritative_wireless",
-            "authoritative_cabling",
-        )),
-        ("Status", (
-            "last_sync",
-            "last_sync_status",
-            "last_sync_message",
-        )),
+        ("General", ("tenant", "name", "enabled")),
+        ("RUCKUS One API", ("api_base_url", "ruckus_tenant_id", "client_id")),
+        ("Defaults", ("default_site_group", "default_device_role", "default_manufacturer")),
+        ("Venue Mapping", ("venue_mapping_mode", "venue_locations_parent_site", "venue_child_location_name")),
+        ("Venue Selection", ("venues_selected",)),
+        ("Stub Objects", ("allow_stub_devices", "allow_stub_vlans", "allow_stub_wireless")),
+        ("Sync Toggles", ("sync_wlans", "sync_aps", "sync_switches", "sync_interfaces", "sync_wifi_clients", "sync_wired_clients", "sync_cabling", "sync_wireless_links", "sync_vlans")),
+        ("Authoritative", ("authoritative_devices", "authoritative_interfaces", "authoritative_ips", "authoritative_vlans", "authoritative_wireless", "authoritative_cabling")),
+        ("Status", ("last_sync", "last_sync_status", "last_sync_message")),
     )
 
 
@@ -75,10 +54,6 @@ class RuckusR1TenantConfigRunView(View):
 
 
 class RuckusR1TenantConfigRefreshVenuesView(View):
-    """
-    Fetch venues from RUCKUS One and store them in cfg.venues_cache.
-    New venues will automatically appear on the left side of the dual list selector.
-    """
     def post(self, request, pk):
         cfg = get_object_or_404(RuckusR1TenantConfig, pk=pk)
         try:
@@ -93,17 +68,12 @@ class RuckusR1TenantConfigRefreshVenuesView(View):
                 if not vid:
                     continue
                 cache.append({"id": vid, "name": name})
-
-            # stable sort
             cache.sort(key=lambda x: ((x.get("name") or "").lower(), x.get("id") or ""))
-
             cfg.venues_cache = cache
             cfg.save()
-
             messages.success(request, f"Venues refreshed: {len(cache)} found.")
         except Exception as e:
             messages.error(request, f"Refresh venues failed: {e}")
-
         return redirect("plugins:ruckus_r1_sync:ruckusr1tenantconfig", pk=pk)
 
 
