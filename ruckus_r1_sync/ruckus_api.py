@@ -152,6 +152,15 @@ class RuckusR1Client:
             raise RuntimeError(f"POST {path} failed ({r.status_code}): {msg}")
         return r.json()
 
+    def get_vlan_unions(self, *, venue_id: str, switch_id: str) -> Dict[str, Any]:
+        """GET /venues/{venueId}/switches/{switchId}/vlanUnions"""
+        venue_id = (venue_id or "").strip()
+        switch_id = (switch_id or "").strip()
+        if not venue_id or not switch_id:
+            raise ValueError("venue_id/switch_id required")
+        return self._get(f"/venues/{venue_id}/switches/{switch_id}/vlanUnions")  # type: ignore[return-value]
+
+
     def query_all(
         self,
         *,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from django.db import models
+from django.contrib.contenttypes.models import ContentType
+from django.contrib.contenttypes.fields import GenericForeignKey
 from django.urls import reverse
 from dcim.models import Site
 
@@ -207,3 +209,56 @@ class RuckusR1Client(NetBoxModel):
 
     def get_absolute_url(self):
         return reverse("plugins:ruckus_r1_sync:ruckusr1client_list")
+
+
+class RuckusR1ObjectMap(NetBoxModel):
+    """Maps a RUCKUS One object (by stable key) to a NetBox object.
+
+    This enables robust rename/update behavior: we never match by name/SSID alone.
+    """
+
+    TYPE_VENUE = "venue"
+    TYPE_DEVICE = "device"
+    TYPE_VLAN = "vlan"
+    TYPE_WLAN = "wlan"
+    TYPE_INTERFACE = "interface"
+
+    TYPE_CHOICES = (
+        (TYPE_VENUE, "Venue"),
+        (TYPE_DEVICE, "Device"),
+        (TYPE_VLAN, "VLAN"),
+        (TYPE_WLAN, "WLAN"),
+        (TYPE_INTERFACE, "Interface"),
+    )
+
+    tenant_config = models.ForeignKey(
+        to=RuckusR1TenantConfig,
+        on_delete=models.CASCADE,
+        related_name="object_maps",
+    )
+
+    object_type = models.CharField(max_length=32, choices=TYPE_CHOICES)
+    r1_key = models.CharField(max_length=256, help_text="Stable RUCKUS One identifier (or composite key)")
+
+    netbox_content_type = models.ForeignKey(
+        to=ContentType,
+        on_delete=models.PROTECT,
+        related_name="+",
+    )
+    netbox_object_id = models.PositiveBigIntegerField()
+    netbox_object = GenericForeignKey("netbox_content_type", "netbox_object_id")
+
+    last_seen = models.DateTimeField(null=True, blank=True)
+    last_r1_name = models.CharField(max_length=200, blank=True, default="")
+
+    class Meta:
+        ordering = ("tenant_config", "object_type", "r1_key")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["tenant_config", "object_type", "r1_key"],
+                name="ruckus_r1_objectmap_unique_key",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.tenant_config.tenant} {self.object_type}:{self.r1_key}"

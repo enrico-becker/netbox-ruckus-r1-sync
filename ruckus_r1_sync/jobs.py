@@ -65,7 +65,7 @@ def _record_failure(cfg: RuckusR1TenantConfig, stop_after_failures: int) -> int:
         cfg.save(update_fields=["custom_field_data", "enabled", "last_updated"])
         return failures
 
-DEFAULT_INTERVAL_MINUTES = 1
+DEFAULT_INTERVAL_MINUTES = 60
 @system_job(interval=DEFAULT_INTERVAL_MINUTES)
 class RuckusSyncAllEnabled(JobRunner):
     """RUCKUS One Sync (all enabled) - System Job"""

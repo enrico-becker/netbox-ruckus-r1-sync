@@ -612,6 +612,81 @@ def _query_all(
     return api.query_all(path=path, page_size=page_size, extra_body=body, data_key=data_key)
 
 
+def _extract_switch_id(sw: Dict[str, Any]) -> str:
+    for k in ("switchId", "id", "switchUnitId", "macAddress", "mac", "switchMac", "deviceMac"):
+        v = sw.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _switch_id_candidates(raw: str) -> List[str]:
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    cands = [raw]
+    # normalize mac forms
+    if _looks_like_mac(raw):
+        cands.append(_norm_mac(raw))
+        cands.append(_norm_mac(raw).replace(":", ""))
+    else:
+        # if 12-hex without separators
+        if len(raw) == 12 and all(ch in "0123456789abcdefABCDEF" for ch in raw):
+            cands.append(_norm_mac(raw))
+    # dedup keep order
+    seen = set()
+    out = []
+    for c in cands:
+        c2 = c.strip()
+        if not c2:
+            continue
+        if c2 not in seen:
+            seen.add(c2)
+            out.append(c2)
+    return out
+
+
+def _build_vlan_name_map_for_venue(api: RuckusR1Client, venue_id: str) -> Dict[int, str]:
+    """
+    Build VLAN ID -> VLAN name map using:
+      GET /venues/{venueId}/switches/{switchId}/vlanUnions
+    Aggregates across all switches in the venue. Prefers profileLevel VLANs over default.
+    """
+    name_by_vid: Dict[int, Tuple[int, str]] = {}  # vid -> (score, name)
+    switches = _query_all(api, "/venues/switches/query", {"venueId": venue_id, "limit": 2000})
+    for sw in switches:
+        if not isinstance(sw, dict):
+            continue
+        raw_id = _extract_switch_id(sw)
+        for sid in _switch_id_candidates(raw_id):
+            try:
+                unions = api.get_vlan_unions(venue_id=venue_id, switch_id=sid)
+            except Exception:
+                continue
+            if not isinstance(unions, dict):
+                continue
+
+            for bucket, base_score in (("profileVlan", 20), ("switchDefaultVlan", 10)):
+                items = unions.get(bucket)
+                if not isinstance(items, list):
+                    continue
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    try:
+                        vid = int(it.get("vlanId"))
+                    except Exception:
+                        continue
+                    name = (it.get("vlanConfigName") or "").strip()
+                    if not name:
+                        continue
+                    score = base_score + (5 if it.get("profileLevel") else 0) + (1 if it.get("defaultVlan") else 0)
+                    prev = name_by_vid.get(vid)
+                    if prev is None or score > prev[0]:
+                        name_by_vid[vid] = (score, name)
+            break  # we had a successful unions response for a candidate id, no need to try more
+    return {vid: nm for vid, (sc, nm) in name_by_vid.items()}
+
 # -----------------
 # Topology helpers (interfaces/macs/cables/wlinks)
 # -----------------
@@ -793,62 +868,12 @@ def _cable_exists_between(a_iface, b_iface) -> bool:
     return bool(a_ids.intersection(b_ids))
 
 
-def _delete_cables_for_termination(iface) -> int:
-    """Delete any existing cables attached to this termination (best effort).
-
-    In NetBox, a termination (e.g. an Interface) can only belong to one Cable end.
-    When running in authoritative mode we remove existing cabling before re-creating it.
-    """
-    try:
-        Cable = _nb_model("dcim", "Cable")
-        CableTermination = _nb_model("dcim", "CableTermination")
-    except Exception:
-        return 0
-
-    try:
-        ct_iface = ContentType.objects.get_for_model(iface.__class__)
-        cable_ids = list(
-            CableTermination.objects.filter(termination_type=ct_iface, termination_id=iface.id)
-            .values_list("cable_id", flat=True)
-        )
-        if cable_ids:
-            Cable.objects.filter(id__in=cable_ids).delete()
-        return len(cable_ids)
-    except Exception:
-        return 0
-
-
-def _termination_has_cable(iface) -> bool:
-    try:
-        CableTermination = _nb_model("dcim", "CableTermination")
-        ct_iface = ContentType.objects.get_for_model(iface.__class__)
-        return CableTermination.objects.filter(termination_type=ct_iface, termination_id=iface.id).exists()
-    except Exception:
-        return False
-
-
-def _create_cable(a_iface, b_iface, status: str = "connected", *, authoritative: bool = False) -> bool:
-    """Create a cable between two interfaces.
-
-    - If the cable already exists, do nothing.
-    - If either termination already has a cable:
-        - authoritative=False: skip (do not overwrite manual cabling)
-        - authoritative=True: delete existing cables on those terminations and re-create
-    """
+def _create_cable(a_iface, b_iface, status: str = "connected") -> bool:
     Cable = _nb_model("dcim", "Cable")
     ct_iface = ContentType.objects.get_for_model(a_iface.__class__)
 
     if _cable_exists_between(a_iface, b_iface):
         return False
-
-    # NetBox enforces a unique cable termination per interface (newer schema).
-    # If we're not authoritative, never overwrite existing cabling.
-    if not _cable_supports_legacy_fields(Cable):
-        if (_termination_has_cable(a_iface) or _termination_has_cable(b_iface)) and not authoritative:
-            return False
-        if authoritative:
-            _delete_cables_for_termination(a_iface)
-            _delete_cables_for_termination(b_iface)
 
     if _cable_supports_legacy_fields(Cable):
         kwargs = dict(
@@ -934,7 +959,7 @@ def _create_wireless_link_best_effort(
 # Switch ports + wired clients
 # -----------------
 
-def _sync_switch_ports_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, site: Site, location, venue_id: str) -> Tuple[int, int, int]:
+def _sync_switch_ports_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, site: Site, location, venue_id: str, vlan_name_map: Optional[Dict[int, str]] = None) -> Tuple[int, int, int]:
     """
     Returns: (touched_ifaces, touched_macs, touched_vlans)
     VLANs are inferred from switch port VLAN fields (vlanIds/unTaggedVlan/accessVlan/managementTrafficVlan).
@@ -1011,7 +1036,8 @@ def _sync_switch_ports_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client,
 
         # Dedup + create
         for vid in sorted({v for v in vids if isinstance(v, int)}):
-            if _upsert_vlan(cfg, site, vid):
+            vname = (vlan_name_map or {}).get(vid, "")
+            if _upsert_vlan(cfg, site, vid, name=vname):
                 touched_vlans += 1
 
         desc_parts = []
@@ -1117,7 +1143,7 @@ def _sync_switch_clients_for_venue(
             if sw:
                 sw_iface = _ensure_interface(sw, port_name)
                 touched_ifaces += 1
-                if _create_cable(sw_iface, client_iface, status="connected", authoritative=bool(getattr(cfg, 'authoritative_cabling', False))):
+                if _create_cable(sw_iface, client_iface, status="connected"):
                     touched_cables += 1
 
         processed_clients += 1
@@ -1228,7 +1254,7 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
                 description=f"R1 topology: {status}".strip(),
             )
 
-            if _create_cable(a_iface, b_iface, status="connected", authoritative=bool(getattr(cfg, 'authoritative_cabling', False))):
+            if _create_cable(a_iface, b_iface, status="connected"):
                 touched_cables += 1
 
         else:
@@ -1268,10 +1294,12 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
     do_wireless_links = _cfg_flag(cfg, "sync_wireless_links", True)
     do_vlans = _cfg_flag(cfg, "sync_vlans", False)
 
-    # Mapping config (plugins.py)
-    mapping_mode = str(_plugin_cfg("venue_mapping_mode", "sites")).strip().lower()
-    parent_site_ref = _plugin_cfg("venue_locations_parent_site", None)
-    child_location_name = str(_plugin_cfg("venue_child_location_name", "Venue"))
+    # Mapping config (prefer DB config, fallback to plugins.py)
+    mapping_mode = str(getattr(cfg, "venue_mapping_mode", "") or _plugin_cfg("venue_mapping_mode", "sites")).strip().lower()
+    child_location_name = str(getattr(cfg, "venue_child_location_name", "") or _plugin_cfg("venue_child_location_name", "Venue")).strip()
+    parent_site_ref = getattr(cfg, "venue_locations_parent_site", None) or _plugin_cfg("venue_locations_parent_site", None)
+
+    # optional legacy knobs
     slug_prefix = str(_plugin_cfg("venue_slug_prefix", "r1"))
 
     api = _make_client(cfg)
@@ -1374,7 +1402,8 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
 
                 # Switch Ports -> dcim.Interface (+ MACs) + VLAN inference
                 if do_interfaces:
-                    it_ports, mt_ports, vt_ports = _sync_switch_ports_for_venue(cfg, api, site, location, venue_id)
+                    vlan_name_map = _build_vlan_name_map_for_venue(api, venue_id) if do_vlans else {}
+                    it_ports, mt_ports, vt_ports = _sync_switch_ports_for_venue(cfg, api, site, location, venue_id, vlan_name_map=vlan_name_map)
                     processed_ifaces += it_ports
                     processed_macs += mt_ports
                     if do_vlans:

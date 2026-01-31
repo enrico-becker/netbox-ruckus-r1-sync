@@ -1,152 +1,162 @@
-# ruckus_r1_sync/mapping.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
+from django.db import transaction
 from django.utils.text import slugify
-from dcim.models import Site, SiteGroup, Location
+
+from dcim.models import Location, Site, SiteGroup
+from tenancy.models import Tenant
+
+
+def _safe_slug(value: str, fallback: str) -> str:
+    s = slugify((value or "").strip())
+    if not s:
+        s = slugify(fallback.strip()) or fallback.strip().lower()
+    return s[:100]
 
 
 @dataclass(frozen=True)
 class VenueMapping:
-    # site, der an Devices gesetzt wird (immer gesetzt)
+    # Where devices/interfaces/VLANs of this venue should land
     device_site: Site
-    # optionale Location, die an Devices gesetzt wird
     device_location: Optional[Location]
-    # der ggf. neu/zusätzlich erstellte Venue-Site (nur mode sites/both)
-    venue_site: Optional[Site]
-    # der ggf. erstellte Venue-Location (mode locations/both)
-    venue_location: Optional[Location]
 
 
-def _deterministic_slug(prefix: str, venue_id: str, name_fallback: str, max_len: int = 100) -> str:
-    base = (venue_id or "").strip() or (name_fallback or "").strip() or "venue"
-    raw = f"{prefix}-{base}".lower()
-    s = slugify(raw)[:max_len]
-    return s or slugify(f"{prefix}-venue")[:max_len]
+def _coerce_site_group(site_group: Optional[SiteGroup]) -> Optional[SiteGroup]:
+    return site_group if isinstance(site_group, SiteGroup) else None
 
 
-def resolve_parent_site(parent_site_ref: str) -> Site:
+def _resolve_parent_site(locations_parent_site, tenant: Optional[Tenant]) -> Site:
+    """Resolve the configured parent site for 'locations' mode.
+
+    Accepts:
+      - Site instance
+      - Site ID (int/str)
+      - Site name (str)
     """
-    Resolve a Site by slug OR exact name (case-insensitive).
-    """
-    if not parent_site_ref:
-        raise Site.DoesNotExist("Empty parent site reference")
+    if isinstance(locations_parent_site, Site):
+        return locations_parent_site
 
-    qs = Site.objects.filter(slug=parent_site_ref)
-    if qs.exists():
-        return qs.first()
+    if locations_parent_site is None:
+        raise ValueError("venue_locations_parent_site is required when venue_mapping_mode='locations'")
 
-    qs = Site.objects.filter(name__iexact=parent_site_ref)
-    if qs.exists():
-        return qs.first()
+    # Try ID
+    try:
+        sid = int(str(locations_parent_site).strip())
+        site = Site.objects.filter(pk=sid).first()
+        if site:
+            return site
+    except Exception:
+        pass
 
-    raise Site.DoesNotExist(f"Parent site not found (by slug or name): {parent_site_ref}")
+    # Fallback name
+    name = str(locations_parent_site).strip()
+    site = Site.objects.filter(name=name).first()
+    if site:
+        return site
+
+    raise ValueError(f"Parent site not found: {locations_parent_site!r}")
 
 
+@transaction.atomic
 def map_venue_to_netbox(
     *,
     venue_id: str,
     venue_name: str,
-    tenant,
+    tenant: Optional[Tenant],
     mode: str,
-    site_group: Optional[SiteGroup],
-    locations_parent_site: Optional[str],
-    child_location_name: str,
+    site_group: Optional[SiteGroup] = None,
+    locations_parent_site=None,
+    child_location_name: str = "Venue",
     slug_prefix: str = "r1",
 ) -> VenueMapping:
-    """
-    modes:
-      - sites:      Venue -> Site
-      - locations:  Venue -> Location under parent Site
-      - both:       Venue -> Site + child Location under that Site
+    """Map a RUCKUS One venue to NetBox objects.
+
+    Modes:
+      - sites:        create/reuse Site per venue, no Location
+      - locations:    reuse existing parent Site, create/reuse Location per venue name under it
+      - both:         create/reuse Site per venue AND create/reuse child Location under that Site
     """
     mode = (mode or "sites").strip().lower()
-    if mode not in {"sites", "locations", "both"}:
-        raise ValueError(f"Invalid venue_mapping_mode: {mode}")
+    sg = _coerce_site_group(site_group)
 
+    venue_name = (venue_name or venue_id or "Venue").strip()
     venue_id = (venue_id or "").strip()
-    venue_name = (venue_name or "").strip() or (venue_id or "Venue")
 
-    venue_site: Optional[Site] = None
-    venue_location: Optional[Location] = None
+    if mode == "locations":
+        parent_site = _resolve_parent_site(locations_parent_site, tenant)
 
-    # Mode A/C: create venue site
-    if mode in {"sites", "both"}:
-        slug = _deterministic_slug(slug_prefix, venue_id, venue_name, max_len=100)
-        venue_site, created = Site.objects.get_or_create(
-            slug=slug,
+        # Location name must be unique per site -> upsert by (site, name)
+        loc_name = venue_name
+        loc, created = Location.objects.get_or_create(
+            site=parent_site,
+            name=loc_name,
             defaults={
-                "name": venue_name[:100],
-                "group": site_group,
+                "slug": _safe_slug(loc_name, f"{slug_prefix}-{venue_id or 'venue'}"),
                 "tenant": tenant,
-                "status": "active",
-                "description": f"RUCKUS One Venue {venue_id}",
             },
         )
-        # keep name/group/tenant aligned
+        # Always update core fields if changed (rename-safe / tenant moves etc.)
+        updates = {}
+        desired_slug = _safe_slug(loc_name, f"{slug_prefix}-{venue_id or 'venue'}")
+        if not (loc.slug or "").strip():
+            updates["slug"] = desired_slug
+        if loc.slug != desired_slug and desired_slug and loc.slug and loc.slug.startswith(f"{slug_prefix}-"):
+            # only auto-adjust if it looks like ours, avoid clobbering user-managed slugs
+            updates["slug"] = desired_slug
+        if getattr(loc, "tenant_id", None) != (tenant.id if tenant else None):
+            updates["tenant"] = tenant
+        if updates:
+            for k, v in updates.items():
+                setattr(loc, k, v)
+            loc.save()
+
+        return VenueMapping(device_site=parent_site, device_location=loc)
+
+    # sites or both -> create/reuse Site per venue
+    site_name = venue_name
+    site = Site.objects.filter(name=site_name).first()
+    if site is None:
+        site = Site.objects.create(
+            name=site_name,
+            slug=_safe_slug(site_name, f"{slug_prefix}-{venue_id or 'site'}"),
+            group=sg,
+            tenant=tenant,
+        )
+    else:
+        # update group/tenant/slug if needed (do not overwrite custom slug unless empty)
         changed = False
-        if venue_site.name != venue_name[:100]:
-            venue_site.name = venue_name[:100]
+        if sg and getattr(site, "group_id", None) != sg.id:
+            site.group = sg
             changed = True
-        if venue_site.group_id != (site_group.id if site_group else None):
-            venue_site.group = site_group
+        if getattr(site, "tenant_id", None) != (tenant.id if tenant else None):
+            site.tenant = tenant
             changed = True
-        if venue_site.tenant_id != getattr(tenant, "id", tenant):
-            venue_site.tenant = tenant
+        if not (site.slug or "").strip():
+            site.slug = _safe_slug(site_name, f"{slug_prefix}-{venue_id or 'site'}")
             changed = True
         if changed:
-            venue_site.save()
+            site.save()
 
-        # devices live on this site
-        device_site = venue_site
-
-        if mode == "both":
-            child_location_name = (child_location_name or "Venue").strip() or "Venue"
-            child_slug = slugify(f"{slug}-{child_location_name}")[:100] or slugify(f"{slug}-venue")[:100]
-            venue_location, _ = Location.objects.get_or_create(
-                site=venue_site,
-                slug=child_slug,
-                defaults={"name": child_location_name[:100]},
-            )
-            if venue_location.name != child_location_name[:100]:
-                venue_location.name = child_location_name[:100]
-                venue_location.save()
-
-            return VenueMapping(
-                device_site=device_site,
-                device_location=venue_location,
-                venue_site=venue_site,
-                venue_location=venue_location,
-            )
-
-        return VenueMapping(
-            device_site=device_site,
-            device_location=None,
-            venue_site=venue_site,
-            venue_location=None,
+    if mode == "both":
+        cname = (child_location_name or "Venue").strip()
+        if not cname:
+            cname = "Venue"
+        loc, _ = Location.objects.get_or_create(
+            site=site,
+            name=cname,
+            defaults={
+                "slug": _safe_slug(cname, f"{slug_prefix}-{venue_id or 'venue'}"),
+                "tenant": tenant,
+            },
         )
+        # keep tenant aligned
+        if getattr(loc, "tenant_id", None) != (tenant.id if tenant else None):
+            loc.tenant = tenant
+            loc.save()
+        return VenueMapping(device_site=site, device_location=loc)
 
-    # Mode B: create venue location under parent site
-    if not locations_parent_site:
-        raise ValueError("venue_locations_parent_site must be set when venue_mapping_mode='locations'")
-
-    parent_site = resolve_parent_site(locations_parent_site)
-    loc_slug = _deterministic_slug(slug_prefix, venue_id, venue_name, max_len=100)
-
-    venue_location, created = Location.objects.get_or_create(
-        site=parent_site,
-        slug=loc_slug,
-        defaults={"name": venue_name[:100]},
-    )
-    if venue_location.name != venue_name[:100]:
-        venue_location.name = venue_name[:100]
-        venue_location.save()
-
-    return VenueMapping(
-        device_site=parent_site,
-        device_location=venue_location,
-        venue_site=None,
-        venue_location=venue_location,
-    )
+    # sites
+    return VenueMapping(device_site=site, device_location=None)
