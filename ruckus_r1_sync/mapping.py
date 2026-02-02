@@ -80,6 +80,11 @@ def map_venue_to_netbox(
       - both:         create/reuse Site per venue AND create/reuse child Location under that Site
     """
     mode = (mode or "sites").strip().lower()
+    # be forgiving with UI / legacy values
+    if mode.startswith("loc"):
+        mode = "locations"
+    elif mode.startswith("site"):
+        mode = "sites"
     sg = _coerce_site_group(site_group)
 
     venue_name = (venue_name or venue_id or "Venue").strip()

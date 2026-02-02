@@ -13,10 +13,12 @@ Das Plugin richtet sich an **Systemintegratoren, Betreiber und Hersteller‑SEs*
 - Sites und Locations (flexibles Mapping)
 - Access Points
 - Switches
-- Interfaces und Verkabelung
-- VLANs inkl. Namen aus `vlanUnions`
-- WLANs / SSIDs
+- **Switch‑Ports als dcim/interfaces**
+- **Interfaces und Verkabelung (idempotent, optional autoritativ)**
+- **VLANs (rename‑fest aus `/venues/{venueId}/switchProfiles/vlans`)**
+- WLANs / SSIDs inkl. VLAN, Verschlüsselung und PSK
 - Kabelgebundene und Wireless Clients
+- **IP‑Adressen (wired & wireless, interface‑gebunden bei Wired)**
 - Wireless Links
 
 ### 🗺️ Venue‑Mapping
@@ -29,11 +31,14 @@ RUCKUS One kann pro Objektklasse autoritativ sein:
 - Devices
 - Interfaces
 - VLANs
-- Wireless
+- Wireless (WLANs & Clients)
 - Cabling
 - IP‑Adressen
 
-Bestehende Objekte werden **aktualisiert statt dupliziert**, inklusive Namensänderungen.
+Bestehende Objekte werden **aktualisiert statt dupliziert**, inklusive:
+- VLAN‑Renames
+- WLAN‑Renames
+- Port‑ und IP‑Änderungen
 
 ### 🎯 Selektiver Venue‑Sync
 - Alle Venues synchronisieren oder
@@ -76,65 +81,24 @@ Bestehende Objekte werden **aktualisiert statt dupliziert**, inklusive Namensän
 ### Wireless LANs
 ![Wireless LANs](docs/screenshots/RUCKUS_Netbox_wireless_wireless-lans.png)
 
+### Wireless LAN – Details
+![Wireless LAN Details](docs/screenshots/RUCKUS_Netbox_wireless_wireless-lans_Details.png)
+
+### Wireless LAN – Changelog
+![Wireless LAN Changelog](docs/screenshots/RUCKUS_Netbox_wireless_wireless-lans_Changelog.png)
+
 ### Wireless Links
 ![Wireless Links](docs/screenshots/RUCKUS_Netbox_wireless_wireless-links.png)
 
 ---
 
-## 📦 Installation
-
-### Voraussetzungen
-- NetBox ≥ 4.0
-- Python ≥ 3.10
-- RUCKUS One Cloud Tenant
-
----
-
-### 🔧 Installation mit netbox‑docker
-
-```bash
-cd netbox-docker/plugins
-git clone https://github.com/<your-org>/netbox-ruckus-r1-sync.git
-```
-
-Plugin aktivieren (`configuration/plugins.py`):
-
-```python
-PLUGINS = [
-    "ruckus_r1_sync",
-]
-```
-
-```bash
-docker compose build
-docker compose up -d
-docker compose exec netbox python manage.py migrate
-```
-
----
-
-### 🔧 Installation (klassisch)
-
-```bash
-source /opt/netbox/venv/bin/activate
-pip install netbox-ruckus-r1-sync
-python manage.py migrate
-python manage.py collectstatic --no-input
-```
-
----
-
-## ⚙️ Konfiguration
-
-1. **Plugins → RUCKUS R1 Sync**
-2. Tenant‑Konfiguration anlegen
-3. API‑Zugangsdaten und Mapping konfigurieren
-4. Venues laden
-5. Sync starten
+## 🗺️ Roadmap
+- Integration von **RUCKUS EDGE**
+- Integration von **RUCKUS IoT Controller**
+- Integration von **RUCKUS WAN Gateway**
 
 ---
 
 ## 📄 Lizenz
 
-Dieses Projekt steht unter der **Apache License, Version 2.0**.  
-Details siehe `LICENSE`‑Datei.
+Dieses Projekt steht unter der **Apache License, Version 2.0**.
