@@ -1,8 +1,8 @@
-# NetBox RUCKUS One Sync Plugin
+# NetBox RUCKUS One Sync Plugin (v0.1.0)
 
-Das **NetBox RUCKUS One Sync Plugin** synchronisiert Inventar‑ und Netzwerkinformationen aus **RUCKUS One (Cloud)** nach **NetBox** und etabliert RUCKUS One als autoritative *Source of Truth* für WLAN‑ und Switching‑Infrastrukturen.
+Das **NetBox RUCKUS One Sync Plugin** synchronisiert Inventar- und Netzwerkinformationen aus **RUCKUS One (Cloud)** nach **NetBox** und etabliert RUCKUS One als autoritative *Source of Truth* für WLAN- und Switching-Infrastrukturen.
 
-Das Plugin richtet sich an **Systemintegratoren, Betreiber und Hersteller‑SEs**, die RUCKUS‑Umgebungen sauber, automatisiert und Enterprise‑tauglich in NetBox dokumentieren möchten.
+Das Plugin richtet sich an **Systemintegratoren, Betreiber und Hersteller-SEs**, die RUCKUS-Umgebungen sauber, automatisiert und Enterprise-tauglich in NetBox dokumentieren möchten.
 
 ---
 
@@ -13,18 +13,18 @@ Das Plugin richtet sich an **Systemintegratoren, Betreiber und Hersteller‑SEs*
 - Sites und Locations (flexibles Mapping)
 - Access Points
 - Switches
-- **Switch‑Ports als dcim/interfaces**
-- **Interfaces und Verkabelung (idempotent, optional autoritativ)**
-- **VLANs (rename‑fest aus `/venues/{venueId}/switchProfiles/vlans`)**
+- Switch-Ports als `dcim/interfaces`
+- Interfaces und Verkabelung (idempotent, optional autoritativ)
+- VLANs (rename-fest aus `/venues/{venueId}/switchProfiles/vlans`)
 - WLANs / SSIDs inkl. VLAN, Verschlüsselung und PSK
 - Kabelgebundene und Wireless Clients
-- **IP‑Adressen (wired & wireless, interface‑gebunden bei Wired)**
+- IP-Adressen (Interface-gebunden bei kabelgebundenen Clients)
 - Wireless Links
 
-### 🗺️ Venue‑Mapping
-- **sites** – Venue wird ein NetBox‑Standort
-- **locations** – Venue wird eine Location unter einem Parent‑Site
-- **both** – Site plus Child‑Location
+### 🗺️ Venue-Mapping
+- **sites** – Venue wird ein NetBox-Standort
+- **locations** – Venue wird eine Location unter einem Parent-Site
+- **both** – Site plus Child-Location
 
 ### 🏷️ Authoritativer Sync
 RUCKUS One kann pro Objektklasse autoritativ sein:
@@ -33,28 +33,28 @@ RUCKUS One kann pro Objektklasse autoritativ sein:
 - VLANs
 - Wireless (WLANs & Clients)
 - Cabling
-- IP‑Adressen
+- IP-Adressen
 
 Bestehende Objekte werden **aktualisiert statt dupliziert**, inklusive:
-- VLAN‑Renames
-- WLAN‑Renames
-- Port‑ und IP‑Änderungen
+- VLAN-Renames
+- WLAN-Renames
+- Port- und IP-Änderungen
 
-### 🎯 Selektiver Venue‑Sync
+### 🎯 Selektiver Venue-Sync
 - Alle Venues synchronisieren oder
-- gezielte Auswahl über Dual‑List‑Selector
+- gezielte Auswahl über Dual-List-Selector
 
 ---
 
 ## 🖼️ Screenshots
 
-### Plugin‑Konfiguration
+### Plugin-Konfiguration
 ![Configs](docs/screenshots/RUCKUS_Netbox_plugins_ruckus-r1-sync_configs.png)
 
-### Tenant‑Konfiguration (Detail)
+### Tenant-Konfiguration (Detail)
 ![Config Detail](docs/screenshots/RUCKUS_Netbox_plugins_ruckus-r1-sync_configs_1.png)
 
-### Tenant‑Konfiguration (Bearbeiten)
+### Tenant-Konfiguration (Bearbeiten)
 ![Config Edit](docs/screenshots/RUCKUS_Netbox_plugins_ruckus-r1-sync_configs_1_edit.png)
 
 ### Devices
@@ -63,7 +63,7 @@ Bestehende Objekte werden **aktualisiert statt dupliziert**, inklusive:
 ### Interfaces
 ![Interfaces](docs/screenshots/RUCKUS_Netbox_dcim_interfaces.png)
 
-### Interface‑Verbindungen
+### Interface-Verbindungen
 ![Interface Connections](docs/screenshots/RUCKUS_Netbox_dcim_interface-connections.png)
 
 ### Verkabelung
@@ -75,7 +75,7 @@ Bestehende Objekte werden **aktualisiert statt dupliziert**, inklusive:
 ### VLANs
 ![VLANs](docs/screenshots/RUCKUS_Netbox_ipam_vlans.png)
 
-### IP‑Adressen
+### IP-Adressen
 ![IPAM](docs/screenshots/RUCKUS_Netbox_ipam_ip-addresses.png)
 
 ### Wireless LANs
@@ -92,6 +92,59 @@ Bestehende Objekte werden **aktualisiert statt dupliziert**, inklusive:
 
 ---
 
+## 📦 Installation
+
+### Voraussetzungen
+- NetBox ≥ 4.0
+- Python ≥ 3.10
+- RUCKUS One Cloud Tenant
+
+---
+
+### 🔧 Installation mit netbox-docker
+
+```bash
+cd netbox-docker/plugins
+git clone https://github.com/<your-org>/netbox-ruckus-r1-sync.git
+```
+
+Plugin aktivieren (`configuration/plugins.py`):
+
+```python
+PLUGINS = [
+    "ruckus_r1_sync",
+]
+```
+
+```bash
+docker compose build
+docker compose up -d
+docker compose exec netbox python manage.py migrate
+```
+
+---
+
+### 🔧 Installation (klassisch)
+
+```bash
+source /opt/netbox/venv/bin/activate
+pip install netbox-ruckus-r1-sync
+python manage.py migrate
+python manage.py collectstatic --no-input
+```
+
+---
+
+## ⚙️ Konfiguration
+
+1. **Plugins → RUCKUS R1 Sync**
+2. Tenant-Konfiguration anlegen
+3. API-Zugangsdaten und Mapping konfigurieren
+4. Venues laden
+5. Sync starten
+
+---
+
 ## 🗺️ Roadmap
 - Integration von **RUCKUS EDGE**
 - Integration von **RUCKUS IoT Controller**
@@ -101,4 +154,5 @@ Bestehende Objekte werden **aktualisiert statt dupliziert**, inklusive:
 
 ## 📄 Lizenz
 
-Dieses Projekt steht unter der **Apache License, Version 2.0**.
+Dieses Projekt steht unter der **Apache License, Version 2.0**.  
+Details siehe `LICENSE`.
