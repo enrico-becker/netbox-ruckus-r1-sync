@@ -4,6 +4,12 @@ from __future__ import annotations
 import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None  # type: ignore
+
+
 from django.apps import apps
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
@@ -212,17 +218,115 @@ def _get_or_create_manufacturer_named(name: str) -> Manufacturer:
     return obj
 
 
-def _get_or_create_ruckus_manufacturer() -> Manufacturer:
-    return _get_or_create_manufacturer_named("RUCKUS Networks")
+def _normalize_manu_name(name: str) -> str:
+    n = (name or '').strip()
+    # Common RUCKUS variants coming from APIs/exports
+    if n.lower() in {'ruckus networks', 'ruckus network', 'ruckus', 'ruckus inc.', 'commscope ruckus', 'commscope'}:
+        return 'Ruckus'
+    return n or 'Ruckus'
 
 
-def _get_or_create_devicetype(manu: Manufacturer, model: str) -> DeviceType:
-    model = (model or "Generic").strip()
-    slug = _slugify(f"{manu.slug}-{model}")[:100]
-    obj = DeviceType.objects.filter(slug=slug, manufacturer=manu).first()
+_DT_CATALOG_CACHE: Dict[str, Dict[str, Dict[str, str]]] = {}
+
+
+def _load_device_type_catalog(cfg: RuckusR1TenantConfig) -> Dict[str, Dict[str, str]]:
+    """Load NetBox DeviceType library YAML (multi-doc) and build model->entry map.
+
+    Priority for catalog path:
+      1) cfg.device_type_catalog_path (if exists)
+      2) PLUGINS_CONFIG['ruckus_r1_sync']['device_type_catalog_path']
+      3) 'netbox_device_types_Ruckus.yaml' next to this file (best-effort)
+    """
+    cache_key = f"{getattr(cfg, 'id', 'cfg')}-{getattr(cfg, 'last_updated', '')}"
+    if cache_key in _DT_CATALOG_CACHE:
+        return _DT_CATALOG_CACHE[cache_key]
+
+    path = getattr(cfg, 'device_type_catalog_path', '') or _plugin_cfg('device_type_catalog_path', '')
+    if not path:
+        try:
+            import os
+            path = os.path.join(os.path.dirname(__file__), 'netbox_device_types_Ruckus.yaml')
+        except Exception:
+            path = ''
+
+    out: Dict[str, Dict[str, str]] = {}
+    if yaml is None or not path:
+        _DT_CATALOG_CACHE[cache_key] = out
+        return out
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            docs = list(yaml.safe_load_all(f))
+        for d in docs:
+            if not isinstance(d, dict):
+                continue
+            manu = _normalize_manu_name(str(d.get('manufacturer') or 'Ruckus'))
+            model = str(d.get('model') or '').strip()
+            slug = str(d.get('slug') or '').strip()
+            part_number = str(d.get('part_number') or '').strip()
+            if not model:
+                continue
+            key = _normalize_model(model)
+            out[key] = {'manufacturer': manu, 'model': model, 'slug': slug, 'part_number': part_number}
+    except Exception:
+        out = {}
+
+    _DT_CATALOG_CACHE[cache_key] = out
+    return out
+
+
+def _normalize_model(model: str) -> str:
+    m = (model or '').strip().upper()
+    for prefix in ('RUCKUS ', 'RUCKUS-', 'RCKS ', 'AP '):
+        if m.startswith(prefix):
+            m = m[len(prefix):]
+    m = m.replace('ACCESS POINT', '').replace('AP', '').strip()
+    return m
+
+
+def _resolve_manufacturer(cfg: RuckusR1TenantConfig, preferred: str = '') -> Manufacturer:
+    """Resolve Manufacturer with correct precedence.
+
+    1) cfg.default_manufacturer (string) if set
+    2) preferred (e.g. from catalog) if set
+    3) fallback 'Ruckus'
+    """
+    name = (getattr(cfg, 'default_manufacturer', '') or '').strip()
+    if not name:
+        name = (preferred or '').strip()
+    name = _normalize_manu_name(name)
+    return _get_or_create_manufacturer_named(name)
+
+
+
+def _get_or_create_devicetype(cfg: RuckusR1TenantConfig, model: str) -> DeviceType:
+    model = (model or 'Generic').strip()
+
+    # Prefer catalog match (model/slug), but always honor cfg.default_manufacturer first
+    catalog = _load_device_type_catalog(cfg)
+    norm = _normalize_model(model)
+    entry = catalog.get(norm)
+    preferred_manu = (entry or {}).get('manufacturer', '') if entry else ''
+    manu = _resolve_manufacturer(cfg, preferred=preferred_manu)
+
+    # 1) If a DeviceType exists for this manufacturer+model, reuse it (even if slug differs)
+    obj = DeviceType.objects.filter(manufacturer=manu, model__iexact=model).first()
+    if obj:
+        return obj
+
+    # 2) If catalog has a slug, try to match by slug for this manufacturer
+    if entry and entry.get('slug'):
+        obj = DeviceType.objects.filter(manufacturer=manu, slug=entry['slug']).first()
+        if obj:
+            return obj
+
+    # 3) Create deterministically (prefer catalog slug when given)
+    slug = (entry.get('slug') if entry else '') or _slugify(f"{manu.slug}-{model}")
+    slug = slug[:100]
+    obj = DeviceType.objects.filter(manufacturer=manu, slug=slug).first()
     if not obj:
         obj = DeviceType.objects.create(manufacturer=manu, model=model[:100], slug=slug)
     return obj
+
 
 
 def _set_device_role_attr(device: Device, role: DeviceRole) -> bool:
@@ -257,8 +361,8 @@ def _get_or_create_device_infra(
     serial: str = "",
 ) -> Device:
     role = _get_or_create_role(role_name or cfg.default_device_role or "Device")
-    manu = _get_or_create_ruckus_manufacturer()
-    dtype = _get_or_create_devicetype(manu, model or "Generic")
+    manu = _resolve_manufacturer(cfg)
+    dtype = _get_or_create_devicetype(cfg, model or "Generic")
 
     name = (name or serial or "device").strip()[:64]
     serial = (serial or "").strip()[:50]
@@ -309,259 +413,32 @@ def _get_or_create_device_infra(
     return obj
 
 
-def _get_or_create_wlan(
-    cfg: RuckusR1TenantConfig,
-    ssid: str,
-    *,
-    r1_wlan_id: str = "",
-    vlan_obj: Optional[VLAN] = None,
-    auth_type: str = "",
-    auth_cipher: str = "Automatisch",
-    psk: Optional[str] = None,
-    wlan_security: str = "",
-    encryption_methods: Optional[List[str]] = None,
-) -> Optional[WirelessLAN]:
+def _get_or_create_wlan(cfg: RuckusR1TenantConfig, ssid: str) -> Optional[WirelessLAN]:
     ssid = (ssid or "").strip()
     if not ssid:
         return None
-
-    fields = {f.name for f in WirelessLAN._meta.get_fields()}
-
-    # We MUST key WLAN updates by RUCKUS One's stable WLAN ID, not by SSID,
-    # otherwise SSID renames create duplicates.
-    r1_wlan_id = (r1_wlan_id or "").strip()
-
-    def _supports_custom_field_key(model_cls, key: str) -> bool:
-        """Return True if NetBox has a CustomField with this name for the model.
-
-        NetBox validates custom_field_data keys; writing an unknown key can fail.
-        We therefore only read/write a key if the CustomField exists.
-        """
-        if not key:
-            return False
-        try:
-            from extras.models import CustomField  # type: ignore
-            ct = ContentType.objects.get_for_model(model_cls)
-            return CustomField.objects.filter(name=key, content_types=ct).exists()
-        except Exception:
-            return False
-
-    cfd_key = "ruckus_r1_wlan_id"
-    can_use_cfd_id = ("custom_field_data" in fields) and _supports_custom_field_key(WirelessLAN, cfd_key)
-    desc_marker = f"[R1-WLAN-ID:{r1_wlan_id}]" if r1_wlan_id else ""
-
-    def _set_psk_best_effort(o: WirelessLAN, value: str) -> bool:
-        # NetBox stores PSK in WirelessLAN.auth_psk (your instance)
-        if not value:
-            return False
-        value = str(value)
-        for field in ("auth_psk", "psk", "pre_shared_key", "passphrase"):
-            if field in fields:
-                if (getattr(o, field) or "") != value:
-                    setattr(o, field, value)
-                    return True
-                return False
-        return False
-
-    obj = None
-    if r1_wlan_id and can_use_cfd_id:
-        # NetBox stores custom_field_data as JSONField; this is filterable.
-        obj = WirelessLAN.objects.filter(
-            tenant=cfg.tenant,
-            **{f"custom_field_data__{cfd_key}": r1_wlan_id},
-        ).first()
-
-    # Fallback if no CF exists: try to find the WLAN by our marker in description
-    if not obj and r1_wlan_id:
-        try:
-            obj = WirelessLAN.objects.filter(tenant=cfg.tenant, description__icontains=desc_marker).first()
-        except Exception:
-            obj = None
-
-    # Fallback for old data (before we stored the R1 WLAN ID)
+    obj = WirelessLAN.objects.filter(tenant=cfg.tenant, ssid=ssid).first()
     if not obj:
-        obj = WirelessLAN.objects.filter(tenant=cfg.tenant, ssid=ssid).first()
-    if not obj:
-        kwargs = {"tenant": cfg.tenant, "ssid": ssid[:64], "status": "active"}
-        if "auth_type" in fields and auth_type:
-            kwargs["auth_type"] = auth_type
-        if "auth_cipher" in fields and auth_cipher:
-            kwargs["auth_cipher"] = auth_cipher
-        if "vlan" in fields and vlan_obj is not None:
-            kwargs["vlan"] = vlan_obj
-
-        obj = WirelessLAN.objects.create(**kwargs)
-
-        changed = False
-        # Only set PSK if present (never overwrite with empty)
-        if psk:
-            if _set_psk_best_effort(obj, psk):
-                changed = True
-
-        # Best-effort meta
-        if "custom_field_data" in fields and can_use_cfd_id:
-            cfd = dict(getattr(obj, "custom_field_data") or {})
-            if r1_wlan_id:
-                cfd[cfd_key] = r1_wlan_id
-            if wlan_security:
-                cfd["ruckus_wlanSecurity"] = wlan_security
-            if encryption_methods is not None:
-                cfd["ruckus_encryptionMethods"] = sorted({str(x).strip() for x in encryption_methods if str(x).strip()})
-            obj.custom_field_data = cfd
-            changed = True
-
-        if hasattr(obj, "description"):
-            parts = []
-            if desc_marker:
-                parts.append(desc_marker)
-            if wlan_security:
-                parts.append(f"wlanSecurity={wlan_security}")
-            if encryption_methods:
-                em = ",".join(sorted({str(x).strip() for x in encryption_methods if str(x).strip()}))
-                if em:
-                    parts.append(f"encMethods={em}")
-            if parts:
-                obj.description = ("R1: " + "; ".join(parts))[:200]
-                changed = True
-
-        if changed:
-            obj.save()
-        return obj
-
-    changed = False
-
-    # SSID rename handling (if R1 WLAN ID matched an existing WLAN):
-    if getattr(obj, "ssid", "") != ssid:
-        obj.ssid = ssid[:64]
-        changed = True
-
-    if "vlan" in fields and vlan_obj is not None and getattr(obj, "vlan_id", None) != vlan_obj.id:
-        obj.vlan = vlan_obj
-        changed = True
-
-    if "auth_type" in fields and auth_type and (getattr(obj, "auth_type", "") or "") != auth_type:
-        obj.auth_type = auth_type
-        changed = True
-
-    if "auth_cipher" in fields and auth_cipher and (getattr(obj, "auth_cipher", "") or "") != auth_cipher:
-        obj.auth_cipher = auth_cipher
-        changed = True
-
-    # Only update PSK if present
-    if psk:
-        if _set_psk_best_effort(obj, psk):
-            changed = True
-
-    if "custom_field_data" in fields and can_use_cfd_id:
-        cfd = dict(getattr(obj, "custom_field_data") or {})
-        if r1_wlan_id and cfd.get(cfd_key) != r1_wlan_id:
-            cfd[cfd_key] = r1_wlan_id
-            changed = True
-        if wlan_security and cfd.get("ruckus_wlanSecurity") != wlan_security:
-            cfd["ruckus_wlanSecurity"] = wlan_security
-            changed = True
-        if encryption_methods is not None:
-            new_list = sorted({str(x).strip() for x in encryption_methods if str(x).strip()})
-            if cfd.get("ruckus_encryptionMethods") != new_list:
-                cfd["ruckus_encryptionMethods"] = new_list
-                changed = True
-        obj.custom_field_data = cfd
-
-    if hasattr(obj, "description"):
-        parts = []
-        if desc_marker:
-            parts.append(desc_marker)
-        if wlan_security:
-            parts.append(f"wlanSecurity={wlan_security}")
-        if encryption_methods:
-            em = ",".join(sorted({str(x).strip() for x in encryption_methods if str(x).strip()}))
-            if em:
-                parts.append(f"encMethods={em}")
-        if parts:
-            new_desc = ("R1: " + "; ".join(parts))[:200]
-            if (getattr(obj, "description", "") or "") != new_desc:
-                obj.description = new_desc
-                changed = True
-
-    if changed:
-        obj.save()
-
+        obj = WirelessLAN.objects.create(tenant=cfg.tenant, ssid=ssid[:64], status="active", auth_type="open")
     return obj
 
 
-
-
-def _upsert_ip(
-    cfg: RuckusR1TenantConfig,
-    ip: str,
-    *,
-    dns_name: str = "",
-    description: str = "",
-    iface=None,
-) -> Optional[IPAddress]:
-    """Create/update an IP address and (optionally) assign it to an interface.
-
-    - Scopes by tenant
-    - Accepts hostnames from R1 client queries
-    - Rename-safe (address is primary key)
-    """
+def _upsert_ip(cfg: RuckusR1TenantConfig, ip: str) -> Optional[IPAddress]:
     ip = (ip or "").strip()
     if not ip:
         return None
     if "/" not in ip:
         ip = f"{ip}/128" if ":" in ip else f"{ip}/32"
-
     obj = IPAddress.objects.filter(address=ip, tenant=cfg.tenant).first()
     if not obj:
-        obj = IPAddress(address=ip, tenant=cfg.tenant, status="active")
-
-    changed = False
-
-    if hasattr(obj, "status") and getattr(obj, "status", None) != "active":
-        obj.status = "active"
-        changed = True
-
-    dns_name = (dns_name or "").strip()
-    if dns_name and hasattr(obj, "dns_name") and (getattr(obj, "dns_name", "") or "") != dns_name:
-        obj.dns_name = dns_name[:255]
-        changed = True
-
-    description = (description or "").strip()
-    if description and hasattr(obj, "description") and (getattr(obj, "description", "") or "") != description:
-        obj.description = description[:200]
-        changed = True
-
-    # Assign to interface if possible
-    if iface is not None:
-        before = None
-        if hasattr(obj, "assigned_object"):
-            before = getattr(obj, "assigned_object", None)
-        _assign_ip_to_interface_best_effort(obj, iface)
-        after = getattr(obj, "assigned_object", None) if hasattr(obj, "assigned_object") else None
-        if before != after:
-            changed = True
-
-    if obj.pk is None or changed:
-        obj.save()
-
+        obj = IPAddress.objects.create(address=ip, tenant=cfg.tenant, status="active")
     return obj
 
 
-
-def _upsert_vlan(
-    cfg: RuckusR1TenantConfig,
-    site: Site,
-    vid: int,
-    *,
-    name: str = "",
-    vlan_meta: Optional[dict] = None,
-) -> Optional[VLAN]:
-    """Create/update NetBox VLANs (rename-safe).
-
-    Primary identity is the stable RUCKUS VLAN object ID (from /switchProfiles/vlans),
-    stored as custom field `ruckus_vlan_id` when available. Fallback lookup is (vid, tenant, site).
-
-    - VLANs are scoped to the Site (because VLAN IDs can repeat across venues).
+def _upsert_vlan(cfg: RuckusR1TenantConfig, site: Site, vid: int, name: str = "") -> Optional[VLAN]:
+    """
+    Create/update NetBox VLANs.
+    - We scope VLANs to the Site (because in many R1 deployments VLAN IDs repeat across venues).
     - If your NetBox uses global VLANs instead, remove `site=site` from the filters.
     """
     try:
@@ -571,76 +448,18 @@ def _upsert_vlan(
     if vid <= 0 or vid > 4094:
         return None
 
-    name = (name or "").strip()
-    if not name and isinstance(vlan_meta, dict):
-        name = (vlan_meta.get("vlanName") or "").strip()
-    if not name:
-        name = f"VLAN {vid}"
-    name = name[:64]
+    name = (name or f"VLAN {vid}").strip()[:64]
 
-    ruckus_vlan_id = ""
-    description = ""
-    if isinstance(vlan_meta, dict):
-        ruckus_vlan_id = (vlan_meta.get("id") or "").strip()
-        # Put useful config into description (fits NetBox's 200 chars limit in many setups)
-        stp = vlan_meta.get("spanningTreeProtocol")
-        stp_prio = vlan_meta.get("spanningTreePriority")
-        igmp = vlan_meta.get("igmpSnooping")
-        dhcp = vlan_meta.get("ipv4DhcpSnooping")
-        arp = vlan_meta.get("arpInspection")
-        parts = []
-        if ruckus_vlan_id:
-            parts.append(f"R1:{ruckus_vlan_id}")
-        if stp:
-            parts.append(f"STP:{stp}/{stp_prio}")
-        if igmp is not None:
-            parts.append(f"IGMP:{igmp}")
-        if dhcp is not None:
-            parts.append(f"DHCP:{dhcp}")
-        if arp is not None:
-            parts.append(f"ARP:{arp}")
-        description = " | ".join([str(p) for p in parts if p]).strip()
+    qs = VLAN.objects.filter(tenant=cfg.tenant, vid=vid)
+    if "site" in {f.name for f in VLAN._meta.get_fields()}:
+        qs = qs.filter(site=site)
 
-    # Preferred lookup by custom field if present
-    obj = None
-    if ruckus_vlan_id:
-        try:
-            obj = VLAN.objects.filter(tenant=cfg.tenant, custom_field_data__ruckus_vlan_id=ruckus_vlan_id).first()
-        except Exception:
-            obj = None
-
-    # Fallback lookup by (vid, tenant, site) with legacy/global compatibility
-    if not obj:
-        qs = VLAN.objects.filter(tenant=cfg.tenant, vid=vid)
-        site_field_exists = "site" in {f.name for f in VLAN._meta.get_fields()}
-        if site_field_exists:
-            # Prefer site-scoped match first
-            obj = qs.filter(site=site).first()
-            # If older runs created global VLANs (site=None), still match them to update names
-            if not obj:
-                obj = qs.filter(site__isnull=True).first()
-        else:
-            obj = qs.first()
-
+    obj = qs.first()
     if not obj:
         kwargs = {"tenant": cfg.tenant, "vid": vid, "name": name}
         if "site" in {f.name for f in VLAN._meta.get_fields()}:
             kwargs["site"] = site
-        if hasattr(VLAN, "status"):
-            kwargs["status"] = "active"
-        if description and hasattr(VLAN, "description"):
-            kwargs["description"] = description[:200]
         obj = VLAN.objects.create(**kwargs)
-
-        if ruckus_vlan_id:
-            try:
-                cf = obj.custom_field_data or {}
-                cf["ruckus_vlan_id"] = ruckus_vlan_id
-                obj.custom_field_data = cf
-                obj.save()
-            except Exception:
-                pass
-
         return obj
 
     changed = False
@@ -653,28 +472,9 @@ def _upsert_vlan(
     if "site" in {f.name for f in VLAN._meta.get_fields()} and obj.site_id != site.id:
         obj.site = site
         changed = True
-    if hasattr(obj, "status") and getattr(obj, "status", None) != "active":
-        obj.status = "active"
-        changed = True
-    if description and hasattr(obj, "description") and (obj.description or "") != description:
-        obj.description = description[:200]
-        changed = True
-
-    if ruckus_vlan_id:
-        try:
-            cf = obj.custom_field_data or {}
-            if cf.get("ruckus_vlan_id") != ruckus_vlan_id:
-                cf["ruckus_vlan_id"] = ruckus_vlan_id
-                obj.custom_field_data = cf
-                changed = True
-        except Exception:
-            pass
-
     if changed:
         obj.save()
     return obj
-
-
 
 
 # -----------------
@@ -682,11 +482,62 @@ def _upsert_vlan(
 # -----------------
 
 def _ensure_interface(device: Device, name: str):
+    """Return an Interface for `device` and `name` (best-effort).
+
+    Important: The RUCKUS APIs sometimes refer to abstract endpoints like 'mgmt' or 'uplink'
+    even though the NetBox DeviceType uses concrete port names (e.g. eth0/eth1 on APs).
+    We try hard to map these synthetic names to existing interfaces to avoid creating
+    bogus 'mgmt'/'uplink' interfaces on devices.
+    """
     Interface = _nb_model("dcim", "Interface")
-    iface = Interface.objects.filter(device=device, name=name).first()
-    if not iface:
-        iface = Interface(device=device, name=name)
-        iface.save()
+    req = (name or "").strip() or "eth0"
+
+    # Exact hit
+    iface = Interface.objects.filter(device=device, name=req).first()
+    if iface:
+        return iface
+
+    # Build a case-insensitive map of existing interfaces
+    existing = {i.name.lower(): i.name for i in Interface.objects.filter(device=device)}
+    synth = req.lower()
+
+    role_slug = (getattr(getattr(device, "role", None), "slug", "") or "").lower()
+    is_switch = "switch" in role_slug
+
+    # Map synthetic names to real ports when possible
+    if synth in ("mgmt", "management", "uplink"):
+        if not is_switch:
+            # Access Points: prefer eth0 as the uplink/PoE-in port
+            for cand in ("eth0", "eth1", "lan0", "ge0", "port0"):
+                if cand in existing:
+                    req = existing[cand]
+                    break
+        else:
+            # Switches: prefer an actual management port if present
+            if synth in ("mgmt", "management"):
+                for cand in ("mgmt", "management", "oob", "oobm", "mgmt0", "mgt"):
+                    if cand in existing:
+                        req = existing[cand]
+                        break
+
+            # For 'uplink' on switches, fall back to the first non-mgmt interface to avoid creating a fake one
+            if synth == "uplink":
+                ifaces = list(Interface.objects.filter(device=device).order_by("name"))
+                for i in ifaces:
+                    lname = (i.name or "").lower()
+                    if lname in ("mgmt", "management", "oob", "oobm", "mgmt0", "mgt"):
+                        continue
+                    req = i.name
+                    break
+
+    # Try again after mapping
+    iface = Interface.objects.filter(device=device, name=req).first()
+    if iface:
+        return iface
+
+    # Create only as a last resort
+    iface = Interface(device=device, name=req)
+    iface.save()
     return iface
 
 
@@ -733,7 +584,7 @@ def _upsert_client_as_dcim_device(
 
     manu = _get_or_create_manufacturer_named("Client")
     model = (cl.get("deviceType") or cl.get("modelName") or "Client").strip()
-    dtype = _get_or_create_devicetype(manu, model)
+    dtype = _get_or_create_devicetype(cfg, model)
 
     raw_hostname = (cl.get("hostname") or "").strip()
     host_part = ""
@@ -829,7 +680,7 @@ def _upsert_wired_client_as_dcim_device(
 
     manu = _get_or_create_manufacturer_named("Client")
     model = (cl.get("deviceType") or cl.get("modelName") or cl.get("manufacturer") or "Client").strip()
-    dtype = _get_or_create_devicetype(manu, model)
+    dtype = _get_or_create_devicetype(cfg, model)
 
     raw_name = (cl.get("hostname") or cl.get("name") or "").strip()
     host_part = ""
@@ -920,133 +771,6 @@ def _query_all(
 # Topology helpers (interfaces/macs/cables/wlinks)
 # -----------------
 
-
-
-def _extract_switch_id(sw: Dict[str, Any]) -> str:
-    for k in ("switchId", "id", "switchUnitId", "macAddress", "mac", "switchMac", "deviceMac"):
-        v = sw.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return ""
-
-def _switch_id_candidates(raw: str) -> List[str]:
-    raw = (raw or "").strip()
-    if not raw:
-        return []
-    cands = [raw]
-    # normalize mac forms
-    if _looks_like_mac(raw):
-        cands.append(_norm_mac(raw))
-        cands.append(_norm_mac(raw).replace(":", ""))
-    else:
-        # if 12-hex without separators
-        if len(raw) == 12 and all(ch in "0123456789abcdefABCDEF" for ch in raw):
-            cands.append(_norm_mac(raw))
-    # dedup keep order
-    seen = set()
-    out = []
-    for c in cands:
-        c2 = c.strip()
-        if not c2:
-            continue
-        if c2 not in seen:
-            seen.add(c2)
-            out.append(c2)
-    return out
-
-
-def _build_vlan_maps_for_venue(api: RuckusR1Client, venue_id: str) -> Tuple[Dict[int, str], Dict[int, dict]]:
-    """Build VLAN maps using the profile VLAN endpoint (rename-safe).
-
-    Primary source:
-      GET /venues/{venueId}/switchProfiles/vlans
-
-    The RUCKUS One API can return either:
-      - a raw JSON list, or
-      - an envelope dict like {"data": [...]}
-
-    Returns:
-      (vlan_name_map, vlan_meta_map)
-        - vlan_name_map: vid -> vlanName
-        - vlan_meta_map: vid -> full vlan dict (includes stable 'id')
-    """
-    vlan_name_map: Dict[int, str] = {}
-    vlan_meta_map: Dict[int, dict] = {}
-
-    try:
-        payload = api._get(f"/venues/{venue_id}/switchProfiles/vlans")
-    except Exception:
-        payload = None
-
-    rows = None
-    if isinstance(payload, list):
-        rows = payload
-    elif isinstance(payload, dict):
-        if isinstance(payload.get("data"), list):
-            rows = payload.get("data")
-        elif isinstance(payload.get("items"), list):
-            rows = payload.get("items")
-
-    if not isinstance(rows, list):
-        return vlan_name_map, vlan_meta_map
-
-    for v in rows:
-        if not isinstance(v, dict):
-            continue
-        try:
-            vid = int(v.get("vlanId"))
-        except Exception:
-            continue
-        if vid <= 0 or vid > 4094:
-            continue
-        name = (v.get("vlanName") or "").strip()
-        if not name:
-            name = f"VLAN {vid}"
-        vlan_name_map[vid] = name
-        vlan_meta_map[vid] = v
-
-    return vlan_name_map, vlan_meta_map
-
-
-
-def _resolve_vlan_for_wifi_network_best_effort(
-    cfg: RuckusR1TenantConfig,
-    vid: int,
-    *,
-    site: Optional[Site] = None,
-) -> Optional[VLAN]:
-    """
-    Try to find a VLAN object for a given VID.
-    - If VLANs are site-scoped and multiple exist, prefer the given site.
-    - Otherwise if exactly one exists, use it.
-    """
-    try:
-        vid = int(vid)
-    except Exception:
-        return None
-    if vid <= 0 or vid > 4094:
-        return None
-
-    qs = VLAN.objects.filter(tenant=cfg.tenant, vid=vid)
-
-    # If we can disambiguate by site, do it
-    if site is not None and "site" in {f.name for f in VLAN._meta.get_fields()}:
-        v = qs.filter(site=site).first()
-        if v:
-            return v
-
-    # Otherwise only safe if unique
-    cnt = qs.count()
-    if cnt == 1:
-        return qs.first()
-
-    return None
-
-
-# -----------------
-# Interface / IP assignment helpers
-# -----------------
-
 def _parse_link_speed_to_kbps(s: str) -> Optional[int]:
     if not s:
         return None
@@ -1113,81 +837,6 @@ def _set_interface_fields_best_effort(
             changed = True
     if changed:
         iface.save()
-
-
-def _set_interface_vlan_membership_best_effort(
-    cfg: RuckusR1TenantConfig,
-    site: Site,
-    iface,
-    *,
-    untagged_vid: Optional[int] = None,
-    tagged_vids: Optional[List[int]] = None,
-    vlan_name_map: Optional[Dict[int, str]] = None,
-    vlan_meta_map: Optional[Dict[int, dict]] = None,
-) -> None:
-    """Best-effort set VLAN mode + untagged/tagged VLANs on a NetBox Interface."""
-    tagged_vids = tagged_vids or []
-    vlan_name_map = vlan_name_map or {}
-    vlan_meta_map = vlan_meta_map or {}
-
-    # Create VLAN objects first (so we can assign relations)
-    untagged_vlan = None
-    if untagged_vid is not None:
-        untagged_vlan = _upsert_vlan(
-            cfg,
-            site,
-            int(untagged_vid),
-            name=vlan_name_map.get(int(untagged_vid), ""),
-            vlan_meta=vlan_meta_map.get(int(untagged_vid)),
-        )
-
-    tagged_vlans = []
-    for v in sorted({int(x) for x in tagged_vids if x is not None}):
-        if untagged_vid is not None and int(v) == int(untagged_vid):
-            continue
-        tv = _upsert_vlan(
-            cfg,
-            site,
-            int(v),
-            name=vlan_name_map.get(int(v), ""),
-            vlan_meta=vlan_meta_map.get(int(v)),
-        )
-        if tv:
-            tagged_vlans.append(tv)
-
-    changed = False
-
-    # Interface.mode
-    if hasattr(iface, "mode"):
-        new_mode = None
-        if tagged_vlans:
-            new_mode = "tagged"
-        elif untagged_vlan:
-            new_mode = "access"
-        if new_mode and getattr(iface, "mode", None) != new_mode:
-            iface.mode = new_mode
-            changed = True
-
-    # Interface.untagged_vlan
-    if untagged_vlan and hasattr(iface, "untagged_vlan_id"):
-        if getattr(iface, "untagged_vlan_id", None) != untagged_vlan.id:
-            iface.untagged_vlan = untagged_vlan
-            changed = True
-
-    # Interface.tagged_vlans (m2m)
-    if hasattr(iface, "tagged_vlans"):
-        try:
-            current_ids = set(getattr(iface, "tagged_vlans").values_list("id", flat=True))
-            new_ids = set([v.id for v in tagged_vlans])
-            if current_ids != new_ids:
-                getattr(iface, "tagged_vlans").set(tagged_vlans)
-                changed = True
-        except Exception:
-            pass
-
-    if changed:
-        iface.save()
-
 
 
 def _upsert_macaddress_best_effort(iface, mac: str) -> bool:
@@ -1299,54 +948,14 @@ def _cable_exists_between(a_iface, b_iface) -> bool:
     return bool(a_ids.intersection(b_ids))
 
 
-def _create_cable(a_iface, b_iface, status: str = "connected", *, replace_existing: bool = False) -> bool:
-    """Create a cable between two interfaces in an idempotent way.
-
-    NetBox enforces that a termination (e.g. an Interface) can only be used once
-    in dcim_cabletermination (unique constraint). If a termination is already
-    cabled, we either:
-      - skip (replace_existing=False), or
-      - delete the existing cable and recreate (replace_existing=True).
-
-    This avoids:
-      IntegrityError: duplicate key value violates unique constraint "dcim_cabletermination_unique_termination"
-    """
+def _create_cable(a_iface, b_iface, status: str = "connected") -> bool:
     Cable = _nb_model("dcim", "Cable")
     ct_iface = ContentType.objects.get_for_model(a_iface.__class__)
 
-    # If the same cable already exists, we're done.
     if _cable_exists_between(a_iface, b_iface):
         return False
 
-    # Legacy cable fields (older NetBox versions)
     if _cable_supports_legacy_fields(Cable):
-        # NOTE: In legacy mode NetBox stores terminations on Cable itself.
-        # We still try to avoid clobbering existing cabling by skipping unless replace_existing=True.
-        existing = Cable.objects.filter(
-            termination_a_type=ct_iface, termination_a_id=a_iface.id
-        ).exists() or Cable.objects.filter(
-            termination_b_type=ct_iface, termination_b_id=a_iface.id
-        ).exists() or Cable.objects.filter(
-            termination_a_type=ct_iface, termination_a_id=b_iface.id
-        ).exists() or Cable.objects.filter(
-            termination_b_type=ct_iface, termination_b_id=b_iface.id
-        ).exists()
-        if existing and not replace_existing:
-            return False
-        if existing and replace_existing:
-            Cable.objects.filter(
-                termination_a_type=ct_iface, termination_a_id=a_iface.id
-            ).delete()
-            Cable.objects.filter(
-                termination_b_type=ct_iface, termination_b_id=a_iface.id
-            ).delete()
-            Cable.objects.filter(
-                termination_a_type=ct_iface, termination_a_id=b_iface.id
-            ).delete()
-            Cable.objects.filter(
-                termination_b_type=ct_iface, termination_b_id=b_iface.id
-            ).delete()
-
         kwargs = dict(
             termination_a_type=ct_iface,
             termination_a_id=a_iface.id,
@@ -1358,34 +967,7 @@ def _create_cable(a_iface, b_iface, status: str = "connected", *, replace_existi
         Cable.objects.create(**kwargs)
         return True
 
-    # Modern NetBox: dcim.CableTermination table enforces uniqueness per termination
     CableTermination = _nb_model("dcim", "CableTermination")
-
-    def _delete_existing_cable_for_iface(iface) -> bool:
-        term = (
-            CableTermination.objects.filter(termination_type=ct_iface, termination_id=iface.id)
-            .select_related("cable")
-            .first()
-        )
-        if not term:
-            return False
-        # Delete the whole cable so both terminations are cleared consistently
-        try:
-            term.cable.delete()
-            return True
-        except Exception:
-            return False
-
-    # If any end is already cabled, either skip or replace.
-    a_busy = CableTermination.objects.filter(termination_type=ct_iface, termination_id=a_iface.id).exists()
-    b_busy = CableTermination.objects.filter(termination_type=ct_iface, termination_id=b_iface.id).exists()
-    if (a_busy or b_busy) and not replace_existing:
-        return False
-    if a_busy and replace_existing:
-        _delete_existing_cable_for_iface(a_iface)
-    if b_busy and replace_existing:
-        _delete_existing_cable_for_iface(b_iface)
-
     cable_kwargs = {}
     if "status" in {f.name for f in Cable._meta.get_fields()}:
         cable_kwargs["status"] = status
@@ -1457,15 +1039,7 @@ def _create_wireless_link_best_effort(
 # Switch ports + wired clients
 # -----------------
 
-def _sync_switch_ports_for_venue(
-    cfg: RuckusR1TenantConfig,
-    api: RuckusR1Client,
-    site: Site,
-    location,
-    venue_id: str,
-    vlan_name_map: Optional[Dict[int, str]] = None,
-    vlan_meta_map: Optional[Dict[int, dict]] = None
-) -> Tuple[int, int, int]:
+def _sync_switch_ports_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, site: Site, location, venue_id: str) -> Tuple[int, int, int]:
     """
     Returns: (touched_ifaces, touched_macs, touched_vlans)
     VLANs are inferred from switch port VLAN fields (vlanIds/unTaggedVlan/accessVlan/managementTrafficVlan).
@@ -1540,53 +1114,10 @@ def _sync_switch_ports_for_venue(
                 except Exception:
                     pass
 
-        
-# Dedup + create
-        dedup_vids = sorted({v for v in vids if isinstance(v, int)})
-        for vid in dedup_vids:
-            vname = (vlan_name_map or {}).get(vid, "")
-            vmeta = (vlan_meta_map or {}).get(vid)
-            if _upsert_vlan(cfg, site, vid, name=vname, vlan_meta=vmeta):
+        # Dedup + create
+        for vid in sorted({v for v in vids if isinstance(v, int)}):
+            if _upsert_vlan(cfg, site, vid):
                 touched_vlans += 1
-
-        # Best-effort assign VLAN membership to interface
-        untagged = None
-        for key in ("unTaggedVlan", "accessVlan", "nativeVlan"):
-            v = p.get(key)
-            try:
-                if v is not None and str(v).strip() != "":
-                    untagged = int(str(v).strip())
-                    break
-            except Exception:
-                pass
-
-        tagged = []
-        vlan_ids = p.get("vlanIds")
-        if isinstance(vlan_ids, list):
-            for v in vlan_ids:
-                try:
-                    tagged.append(int(str(v).strip()))
-                except Exception:
-                    pass
-        elif isinstance(vlan_ids, str):
-            for part in vlan_ids.replace(";", ",").split(","):
-                part = part.strip()
-                if not part:
-                    continue
-                try:
-                    tagged.append(int(part))
-                except Exception:
-                    pass
-
-        _set_interface_vlan_membership_best_effort(
-            cfg,
-            site,
-            iface,
-            untagged_vid=untagged,
-            tagged_vids=tagged,
-            vlan_name_map=vlan_name_map,
-            vlan_meta_map=vlan_meta_map,
-        )
 
         desc_parts = []
         if p.get("tags"):
@@ -1685,24 +1216,13 @@ def _sync_switch_clients_for_venue(
             if client_dev:
                 client_iface = _ensure_interface(client_dev, "eth0")
                 touched_ifaces += 1
-                # IP address assignment (wired client)
-                if ip:
-                    dns = (cl.get("dhcpClientHostName") or hostname or cl.get("clientName") or "").strip()
-                    desc = []
-                    if cl.get("clientDesc"):
-                        desc.append(str(cl.get("clientDesc")))
-                    if vlan_int is not None:
-                        desc.append(f"VLAN {vlan_int}")
-                    if mac and mac != "unknown":
-                        desc.append(f"MAC {mac}")
-                    _upsert_ip(cfg, ip, dns_name=dns, description=" | ".join(desc), iface=client_iface)
 
         if client_dev and client_iface and switch_unit_id and port_name:
             sw = Device.objects.filter(tenant=cfg.tenant, site=site, serial=switch_unit_id).first()
             if sw:
                 sw_iface = _ensure_interface(sw, port_name)
                 touched_ifaces += 1
-                if _create_cable(sw_iface, client_iface, status="connected", replace_existing=bool(getattr(cfg, "cabling_authoritative", False))):
+                if _create_cable(sw_iface, client_iface, status="connected"):
                     touched_cables += 1
 
         processed_clients += 1
@@ -1754,14 +1274,8 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
 
         dev = _get_or_create_device_infra(cfg, site, location, role, model, name or serial or mac or "device", serial=serial)
 
-
         if ip:
-            mgmt_iface = None
-            try:
-                mgmt_iface = _ensure_interface(dev, "mgmt")
-            except Exception:
-                mgmt_iface = None
-            _upsert_ip(cfg, ip, dns_name=name or serial or "", description=f"mgmt for {dev.name}", iface=mgmt_iface)
+            _upsert_ip(cfg, ip)
 
         if mac:
             mgmt = _ensure_interface(dev, "mgmt")
@@ -1819,7 +1333,7 @@ def _sync_topologies_for_venue(cfg: RuckusR1TenantConfig, api: RuckusR1Client, s
                 description=f"R1 topology: {status}".strip(),
             )
 
-            if _create_cable(a_iface, b_iface, status="connected", replace_existing=bool(getattr(cfg, "cabling_authoritative", False))):
+            if _create_cable(a_iface, b_iface, status="connected"):
                 touched_cables += 1
 
         else:
@@ -1859,12 +1373,28 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
     do_wireless_links = _cfg_flag(cfg, "sync_wireless_links", True)
     do_vlans = _cfg_flag(cfg, "sync_vlans", False)
 
-    # Mapping config (prefer DB config, fallback to plugins.py)
-    mapping_mode = str(getattr(cfg, "venue_mapping_mode", "") or _plugin_cfg("venue_mapping_mode", "sites")).strip().lower()
-    child_location_name = str(getattr(cfg, "venue_child_location_name", "") or _plugin_cfg("venue_child_location_name", "Venue")).strip()
-    parent_site_ref = getattr(cfg, "venue_locations_parent_site", None) or _plugin_cfg("venue_locations_parent_site", None)
+    # Mapping config: prefer per-tenant config, fall back to plugins.py
+    cfg_mode = None
+    try:
+        cfg_mode = getattr(cfg, "venue_mapping_mode", None)
+    except Exception:
+        cfg_mode = None
+    mapping_mode = str(cfg_mode or _plugin_cfg("venue_mapping_mode", "sites")).strip().lower()
 
-    # optional legacy knobs
+    cfg_parent_site = None
+    try:
+        cfg_parent_site = getattr(cfg, "venue_locations_parent_site", None)
+    except Exception:
+        cfg_parent_site = None
+    parent_site_ref = cfg_parent_site if cfg_parent_site is not None else _plugin_cfg("venue_locations_parent_site", None)
+
+    cfg_child_loc = None
+    try:
+        cfg_child_loc = getattr(cfg, "venue_child_location_name", None)
+    except Exception:
+        cfg_child_loc = None
+    child_location_name = str((cfg_child_loc or "").strip() or _plugin_cfg("venue_child_location_name", "Venue"))
+
     slug_prefix = str(_plugin_cfg("venue_slug_prefix", "r1"))
 
     api = _make_client(cfg)
@@ -1884,10 +1414,11 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
 
             log.venues = len(venues)
 
-            # Fetch WiFi networks once; assign per-venue later to allow site-scoped VLAN disambiguation
-            wifi_networks: List[Dict[str, Any]] = []
             if do_wlans:
                 wifi_networks = _query_all(api, "/wifiNetworks/query", {"limit": 500})
+                for wn in wifi_networks:
+                    ssid = (wn.get("ssid") or wn.get("name") or "").strip()
+                    _get_or_create_wlan(cfg, ssid)
                 log.wlans = len(wifi_networks)
             else:
                 log.wlans = 0
@@ -1900,10 +1431,6 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
             processed_cables = 0
             processed_wlinks = 0
             processed_vlans = 0
-
-            wifi_details_cache: Dict[str, Dict[str, Any]] = {}
-
-            enc_methods_by_ssid: Dict[str, set] = {}
 
             for venue in venues:
                 venue_id = _safe_str(venue.get("id") or venue.get("venueId") or "", 128)
@@ -1923,122 +1450,6 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
                 # Site/Location for all objects in this venue context
                 site = mapping.device_site
                 location = mapping.device_location
-                # -----------------
-                # VLAN name map (per venue)
-                # -----------------
-                vlan_name_map, vlan_meta_map = _build_vlan_maps_for_venue(api, venue_id) if do_vlans else ({}, {})
-
-                # Ensure all VLANs from the profile list exist and names are updated (rename-safe)
-                if do_vlans and vlan_meta_map:
-                    for _vid, _meta in vlan_meta_map.items():
-                        try:
-                            _vid_int = int(_vid)
-                        except Exception:
-                            continue
-                        _name = vlan_name_map.get(_vid_int, "")
-                        _upsert_vlan(cfg, site, _vid_int, name=_name, vlan_meta=_meta)
-
-                # -----------------
-                # WLANs (SSID) + Security (PSK/Enterprise) + VLAN mapping
-                # -----------------
-                if do_wlans and wifi_networks:
-                    for wn in wifi_networks:
-                        if not isinstance(wn, dict):
-                            continue
-
-                        # If the API provides venueApGroups with venueId, prefer those. If empty, treat as global.
-                        applies = False
-                        groups = wn.get("venueApGroups")
-                        if isinstance(groups, list) and groups:
-                            for g in groups:
-                                if not isinstance(g, dict):
-                                    continue
-                                if str(g.get("venueId") or "").strip() == venue_id:
-                                    applies = True
-                                    break
-                        else:
-                            applies = True
-
-                        if not applies:
-                            continue
-
-                        ssid = (wn.get("ssid") or wn.get("name") or "").strip()
-                        wn_id = (wn.get("id") or "").strip()
-                        if not ssid:
-                            continue
-
-                        details: Dict[str, Any] = {}
-                        if wn_id:
-                            details = wifi_details_cache.get(wn_id, {})
-                            if not details:
-                                try:
-                                    details = api._get(f"/wifiNetworks/{wn_id}") or {}
-                                except Exception:
-                                    details = {}
-                                wifi_details_cache[wn_id] = details
-
-                        wlan_d = details.get("wlan") or {}
-                        if not isinstance(wlan_d, dict):
-                            wlan_d = {}
-
-                        # VLAN ID (prefer detail payload, fallback to list payload)
-                        vid = None
-                        try:
-                            vid = wlan_d.get("vlanId") if wlan_d.get("vlanId") is not None else wlan_d.get("vlan")
-                            if vid is None:
-                                vid = wn.get("vlanId") if wn.get("vlanId") is not None else wn.get("vlan")
-                        except Exception:
-                            vid = None
-
-                        vlan_obj = None
-                        try:
-                            if vid is not None and str(vid).strip() != "":
-                                vid_int = int(str(vid).strip())
-                                vlan_obj = _resolve_vlan_for_wifi_network_best_effort(cfg, vid_int, site=site)
-                                if vlan_obj is None and do_vlans:
-                                    vlan_obj = _upsert_vlan(cfg, site, vid_int, name=vlan_name_map.get(vid_int, ""), vlan_meta=vlan_meta_map.get(vid_int))
-                        except Exception:
-                            vlan_obj = None
-
-                        # Security / PSK / cipher mapping
-                        nw_type = (details.get("type") or wn.get("nwSubType") or "").strip().lower()
-
-                        auth_type = ""
-                        if nw_type == "psk":
-                            auth_type = "WPA Persönlich (PSK)"
-                        elif nw_type == "aaa":
-                            auth_type = "WPA Enterprise"
-                        elif "wep" in str(details).lower():
-                            auth_type = "WEP"
-
-                        wlan_security = (wlan_d.get("wlanSecurity") or "").strip()
-                        psk = str((wlan_d.get("passphrase") or "")).strip()
-
-                        auth_cipher = "Automatisch"
-                        ws = wlan_security.lower()
-                        if "tkip" in ws:
-                            auth_cipher = "TKIP"
-                        elif any(x in ws for x in ("wpa2", "wpa3", "aes", "ccmp")):
-                            auth_cipher = "AES"
-
-                        enc_methods = wlan_d.get("encryptionMethods")
-                        if not isinstance(enc_methods, list):
-                            enc_methods = None
-
-                        r1_wlan_id = str(wlan_d.get("id") or wn.get("id") or "").strip()
-
-                        _get_or_create_wlan(
-                            cfg,
-                            ssid,
-                            r1_wlan_id=r1_wlan_id,
-                            vlan_obj=vlan_obj,
-                            auth_type=auth_type,
-                            auth_cipher=auth_cipher,
-                            psk=psk,
-                            wlan_security=wlan_security,
-                            encryption_methods=enc_methods,
-                        )
-
 
                 # APs
                 if do_aps:
@@ -2086,7 +1497,7 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
 
                 # Switch Ports -> dcim.Interface (+ MACs) + VLAN inference
                 if do_interfaces:
-                    it_ports, mt_ports, vt_ports = _sync_switch_ports_for_venue(cfg, api, site, location, venue_id, vlan_name_map=vlan_name_map, vlan_meta_map=vlan_meta_map)
+                    it_ports, mt_ports, vt_ports = _sync_switch_ports_for_venue(cfg, api, site, location, venue_id)
                     processed_ifaces += it_ports
                     processed_macs += mt_ports
                     if do_vlans:
@@ -2106,10 +1517,6 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
                         netinfo = cl.get("networkInformation") or {}
                         ssid = (netinfo.get("ssid") or cl.get("ssid") or "").strip()
 
-                        enc = (cl.get("encryptionMethod") or netinfo.get("encryptionMethod") or "").strip()
-                        if ssid and enc:
-                            enc_methods_by_ssid.setdefault(ssid, set()).add(enc)
-
                         apinfo = cl.get("apInformation") or {}
                         ap_serial = (apinfo.get("serialNumber") or cl.get("apSerial") or cl.get("connectedApSerial") or "").strip()
 
@@ -2127,21 +1534,6 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
                                 if isinstance(v, str) and _looks_like_mac(v):
                                     mac = _norm_mac(v)
                                     break
-                        # IP address (wireless client) - leave unassigned (no interface in NetBox)
-                        if ip:
-                            dns = (hostname or "").strip()
-                            desc_parts = []
-                            if cl.get("modelName"):
-                                desc_parts.append(str(cl.get("modelName")))
-                            if cl.get("osType"):
-                                desc_parts.append(str(cl.get("osType")))
-                            if cl.get("deviceType"):
-                                desc_parts.append(str(cl.get("deviceType")))
-                            if ssid:
-                                desc_parts.append(f"SSID {ssid}")
-                            if mac and mac != "unknown":
-                                desc_parts.append(f"MAC {mac}")
-                            _upsert_ip(cfg, ip, dns_name=dns, description=" | ".join(desc_parts))
 
                         if not _looks_like_mac(mac):
                             mac = "unknown"
@@ -2184,29 +1576,6 @@ def run_sync_for_tenantconfig(cfg_or_id: Union[RuckusR1TenantConfig, int]) -> st
                         processed_cables += ct
                     if do_wireless_links:
                         processed_wlinks += wt
-
-            # Update WLANs with observed client encryption methods (best-effort)
-            if do_wlans and enc_methods_by_ssid:
-                for _ssid, _methods in enc_methods_by_ssid.items():
-                    try:
-                        if not _ssid:
-                            continue
-                        # derive cipher from observed methods
-                        up = [str(x).upper() for x in _methods if x]
-                        cipher = "Automatisch"
-                        if any("AES" in x for x in up):
-                            cipher = "AES"
-                        elif any("TKIP" in x for x in up):
-                            cipher = "TKIP"
-                        _get_or_create_wlan(
-                            cfg,
-                            _ssid,
-                            encryption_methods=sorted({str(x).strip() for x in _methods if str(x).strip()}),
-                            auth_cipher=cipher,
-                        )
-                    except Exception:
-                        continue
-
 
             log.devices = processed_devices
             log.ips = processed_ips
